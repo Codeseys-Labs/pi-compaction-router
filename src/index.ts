@@ -18,7 +18,7 @@ function estimatedInputTokens(preparation: { messagesToSummarize: unknown[]; tur
 }
 
 export default function compactionRouter(pi: ExtensionAPI): void {
-  let skipOneAutomaticResume = false;
+  const explicitResumeSessions = new Set<string>();
 
   pi.on("session_before_compact", async (event, ctx) => {
     const config = loadConfig(ctx);
@@ -56,7 +56,8 @@ export default function compactionRouter(pi: ExtensionAPI): void {
 
   pi.on("session_compact", (event, ctx) => {
     if (event.willRetry) return; // Pi already resumes overflow recovery.
-    if (skipOneAutomaticResume) { skipOneAutomaticResume = false; return; }
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (explicitResumeSessions.delete(sessionId)) return;
     const config = loadConfig(ctx);
     if (!config || !config.resume.reasons.includes(event.reason as CompactionReason)) return;
     pi.sendMessage({ customType: "compaction-router-resume", content: config.resume.message, display: true }, { deliverAs: "followUp", triggerTurn: true });
@@ -65,13 +66,14 @@ export default function compactionRouter(pi: ExtensionAPI): void {
   pi.registerCommand("compact-resume", {
     description: "Compact with the configured router, then resume the in-progress task",
     handler: async (args, ctx) => {
-      skipOneAutomaticResume = true;
+      const sessionId = ctx.sessionManager.getSessionId();
+      explicitResumeSessions.add(sessionId);
       const config = loadConfig(ctx);
       const message = config?.resume.message ?? "Compaction completed. Resume the in-progress task from the retained summary and current repository state. Continue with the next concrete steps; if complete, verify and report completion.";
       ctx.compact({
         customInstructions: args.trim() || undefined,
         onComplete: () => pi.sendMessage({ customType: "compaction-router-resume", content: message, display: true }, { deliverAs: "followUp", triggerTurn: true }),
-        onError: error => { skipOneAutomaticResume = false; ctx.ui.notify(`Compaction failed: ${error.message}`, "error"); },
+        onError: error => { explicitResumeSessions.delete(sessionId); ctx.ui.notify(`Compaction failed: ${error.message}`, "error"); },
       });
     },
   });
