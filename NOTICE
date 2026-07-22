@@ -1,0 +1,7 @@
+This project incorporates and adapts portions of pi-compaction-model:
+https://github.com/JMHSV/pi-compaction-model
+Copyright (c) 2026 JMHSV, licensed under the MIT License.
+
+The native compaction integration and file-operation restoration logic are derived
+from that project. Routing, fallback, validation, diagnostics, and post-compaction
+resume behavior are additional work in pi-compaction-router.
