@@ -55,6 +55,24 @@ Add `compactionRouter` to global `~/.pi/agent/settings.json` or trusted project 
 - Missing models, missing authentication, and models too small for a conservative input estimate are skipped.
 - `overflow` never receives an extra resume turn because Pi already retries the interrupted request.
 
+Settings are re-read at every compaction, so global or trusted project changes take effect during the current session without `/reload`.
+
+### Session-local configuration
+
+Use `/compaction-router-config` to edit a JSON override for only the current session. The editor starts with the effective global/project configuration. The saved override applies immediately and is discarded at session shutdown.
+
+```text
+/compaction-router-config
+/compaction-router-config off
+/compaction-router-config reset
+/compaction-router-config {"models":[{"model":"openai-codex/gpt-5.4-mini","thinkingLevel":"low"}]}
+```
+
+- `off` disables routing for this session.
+- `reset` returns the session to live global/project settings.
+- Inline JSON supports RPC and scripted use without an interactive editor.
+- Invalid JSON, route entries, reasons, or thinking levels are rejected rather than partially applied.
+
 ## Post-compaction continuation
 
 Auto-resume is off by default because automatic continuation consumes tokens and can be surprising after a completed task. Enable selected reasons explicitly, or use the safer one-shot command:
@@ -68,10 +86,11 @@ After successful compaction, the extension injects a visible custom continuation
 
 ## Commands
 
-- `/compaction-router` — show active model, routes, fallback order, thinking levels, and auto-resume policy.
+- `/compaction-router` — show active model, configuration source, routes, fallback order, thinking levels, and auto-resume policy.
+- `/compaction-router-config [off|reset|JSON]` — edit or replace the current session's routing policy.
 - `/compact-resume [instructions]` — compact and explicitly continue.
 
-Pi does not currently expose an extension API for adding arbitrary fields to the built-in `/settings` menu. A future release may add a package-owned interactive configuration command; v0.1 keeps configuration reviewable in JSON.
+Pi does not currently expose an extension API for adding arbitrary fields to the built-in `/settings` menu. Persistent configuration remains reviewable in JSON; the package-owned command is intentionally session-scoped.
 
 ## Safety and limitations
 

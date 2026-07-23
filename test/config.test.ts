@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { globMatch, parseModelReference, resolveConfig, selectTargets } from "../src/config.js";
+import { configToSettingsValue, globMatch, parseModelReference, parseSessionOverride, resolveConfig, selectTargets } from "../src/config.js";
 
 const target = { model: "anthropic/claude-sonnet-4-5", thinkingLevel: "low" as const };
 
@@ -18,6 +18,22 @@ describe("configuration", () => {
   test("project configuration replaces route arrays", () => {
     const config = resolveConfig({ compactionRouter: { models: [target] } }, { compactionRouter: { models: [{ model: "openai/gpt" }] } });
     expect(config?.defaults).toEqual([{ model: "openai/gpt", thinkingLevel: undefined }]);
+  });
+  test("round-trips normalized settings through a session override", () => {
+    const config = resolveConfig({ compactionRouter: { models: [target], resume: { enabled: true, reasons: ["manual"] } } }, {})!;
+    const parsed = parseSessionOverride(JSON.stringify(configToSettingsValue(config)));
+    expect(parsed.ok).toBeTrue();
+    if (parsed.ok) expect(parsed.config).toEqual(config);
+  });
+  test("accepts an explicit session disable", () => {
+    expect(parseSessionOverride("false")).toEqual({ ok: true, config: null });
+    expect(parseSessionOverride('{"enabled":false}')).toEqual({ ok: true, config: null });
+  });
+  test("rejects malformed or partially invalid session overrides", () => {
+    expect(parseSessionOverride("{").ok).toBeFalse();
+    expect(parseSessionOverride("[]").ok).toBeFalse();
+    expect(parseSessionOverride('{"models":[{"model":"openai/gpt","thinkingLevel":"ultra"}]}').ok).toBeFalse();
+    expect(parseSessionOverride("{}").ok).toBeFalse();
   });
 });
 

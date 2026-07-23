@@ -1,5 +1,5 @@
 import { compact, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { loadConfig, parseModelReference, selectTargets, type CompactionReason } from "./config.js";
+import { configToSettingsValue, loadConfig, parseModelReference, parseSessionOverride, selectTargets, type CompactionReason, type RouterConfig } from "./config.js";
 
 const TAG = "pi-compaction-router";
 const warn = (message: string, error?: unknown) => error === undefined ? console.warn(`[${TAG}] ${message}`) : console.warn(`[${TAG}] ${message}`, error);
@@ -19,9 +19,14 @@ function estimatedInputTokens(preparation: { messagesToSummarize: unknown[]; tur
 
 export default function compactionRouter(pi: ExtensionAPI): void {
   const explicitResumeSessions = new Set<string>();
+  const sessionOverrides = new Map<string, RouterConfig | null>();
+  const configFor = (ctx: Parameters<typeof loadConfig>[0]): RouterConfig | null => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    return sessionOverrides.has(sessionId) ? sessionOverrides.get(sessionId)! : loadConfig(ctx);
+  };
 
   pi.on("session_before_compact", async (event, ctx) => {
-    const config = loadConfig(ctx);
+    const config = configFor(ctx);
     if (!config) return;
     const active = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown/unknown";
     const targets = selectTargets(config, active, event.reason);
@@ -58,7 +63,7 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     if (event.willRetry) return; // Pi already resumes overflow recovery.
     const sessionId = ctx.sessionManager.getSessionId();
     if (explicitResumeSessions.delete(sessionId)) return;
-    const config = loadConfig(ctx);
+    const config = configFor(ctx);
     if (!config || !config.resume.reasons.includes(event.reason as CompactionReason)) return;
     pi.sendMessage({ customType: "compaction-router-resume", content: config.resume.message, display: true }, { deliverAs: "followUp", triggerTurn: true });
   });
@@ -68,7 +73,7 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     handler: async (args, ctx) => {
       const sessionId = ctx.sessionManager.getSessionId();
       explicitResumeSessions.add(sessionId);
-      const config = loadConfig(ctx);
+      const config = configFor(ctx);
       const message = config?.resume.message ?? "Compaction completed. Resume the in-progress task from the retained summary and current repository state. Continue with the next concrete steps; if complete, verify and report completion.";
       ctx.compact({
         customInstructions: args.trim() || undefined,
@@ -81,12 +86,47 @@ export default function compactionRouter(pi: ExtensionAPI): void {
   pi.registerCommand("compaction-router", {
     description: "Show compaction-router routes and resume policy",
     handler: async (_args, ctx) => {
-      const config = loadConfig(ctx);
-      if (!config) { ctx.ui.notify("pi-compaction-router is disabled or has no valid routes.", "warning"); return; }
+      const sessionId = ctx.sessionManager.getSessionId();
+      const config = configFor(ctx);
+      if (!config) { ctx.ui.notify(`pi-compaction-router is disabled${sessionOverrides.has(sessionId) ? " by this session's override" : " or has no valid routes"}.`, "warning"); return; }
       const active = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown/unknown";
       const lines = (["manual", "threshold", "overflow"] as CompactionReason[]).map(reason => `${reason}: ${selectTargets(config, active, reason).map(x => `${x.model}${x.thinkingLevel ? `:${x.thinkingLevel}` : ""}`).join(" -> ") || "Pi active model"}`);
-      ctx.ui.notify(`Active: ${active}\n${lines.join("\n")}\nAuto-resume: ${config.resume.reasons.join(", ") || "off"}`, "info");
+      const source = sessionOverrides.has(sessionId) ? "session override" : "settings";
+      ctx.ui.notify(`Active: ${active}\nSource: ${source}\n${lines.join("\n")}\nAuto-resume: ${config.resume.reasons.join(", ") || "off"}`, "info");
     },
+  });
+
+  pi.registerCommand("compaction-router-config", {
+    description: "Edit a session-local compaction-router override",
+    handler: async (args, ctx) => {
+      const sessionId = ctx.sessionManager.getSessionId();
+      const input = args.trim();
+      if (input === "reset") {
+        sessionOverrides.delete(sessionId);
+        ctx.ui.notify("Compaction router reset to global/project settings for this session.", "info");
+        return;
+      }
+      let source = input;
+      if (input === "off") source = "false";
+      if (!source) {
+        const current = configFor(ctx);
+        source = await ctx.ui.editor(
+          "Compaction router — session override JSON",
+          JSON.stringify(configToSettingsValue(current), null, 2),
+        ) ?? "";
+        if (!source) { ctx.ui.notify("Compaction router configuration unchanged.", "info"); return; }
+      }
+      const result = parseSessionOverride(source);
+      if (!result.ok) { ctx.ui.notify(result.error, "error"); return; }
+      sessionOverrides.set(sessionId, result.config);
+      ctx.ui.notify(result.config ? "Session compaction-router override applied immediately." : "Compaction router disabled for this session.", "info");
+    },
+  });
+
+  pi.on("session_shutdown", (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    explicitResumeSessions.delete(sessionId);
+    sessionOverrides.delete(sessionId);
   });
 }
 

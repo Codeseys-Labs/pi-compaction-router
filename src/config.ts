@@ -9,6 +9,7 @@ export interface ModelTarget { model: string; thinkingLevel?: ThinkingLevel }
 export interface Route { match: string; models: ModelTarget[]; reasons: CompactionReason[] }
 export interface ResumeConfig { reasons: CompactionReason[]; message: string }
 export interface RouterConfig { routes: Route[]; defaults: ModelTarget[]; resume: ResumeConfig }
+export type SessionOverrideResult = { ok: true; config: RouterConfig | null } | { ok: false; error: string };
 
 type Rec = Record<string, unknown>;
 const DEFAULT_RESUME = "Compaction completed. Resume the in-progress task from the retained summary and current repository state. Continue executing the next concrete steps instead of merely summarizing or waiting. If the original task is already complete, verify it and report completion rather than inventing more work.";
@@ -60,6 +61,34 @@ export function loadConfig(ctx: ExtensionContext): RouterConfig | null {
   const s = SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted: ctx.isProjectTrusted() });
   return resolveConfig(s.getGlobalSettings(), ctx.isProjectTrusted() ? s.getProjectSettings() : undefined);
 }
+
+export function configToSettingsValue(config: RouterConfig | null): false | Rec {
+  if (!config) return false;
+  return {
+    enabled: true,
+    routes: config.routes,
+    models: config.defaults,
+    resume: {
+      enabled: config.resume.reasons.length > 0,
+      reasons: config.resume.reasons,
+      message: config.resume.message,
+    },
+  };
+}
+
+export function parseSessionOverride(text: string): SessionOverrideResult {
+  let value: unknown;
+  try { value = JSON.parse(text); }
+  catch (error) { return { ok: false, error: `Invalid JSON: ${error instanceof Error ? error.message : String(error)}` }; }
+  if (value === false || (record(value) && value.enabled === false)) return { ok: true, config: null };
+  if (!record(value)) return { ok: false, error: "Expected a router configuration object or false." };
+  const warnings: string[] = [];
+  const config = resolveConfig({ compactionRouter: value }, undefined, message => warnings.push(message));
+  if (warnings.length) return { ok: false, error: warnings.join(" ") };
+  if (!config) return { ok: false, error: "Configuration has no valid routes, fallback models, or resume policy." };
+  return { ok: true, config };
+}
+
 export function parseModelReference(ref: string): { provider: string; modelId: string } | null {
   const i = ref.indexOf("/"); if (i <= 0 || i === ref.length - 1) return null;
   const provider = ref.slice(0, i).trim(), modelId = ref.slice(i + 1).trim();
