@@ -11,7 +11,7 @@ A large-context parent can require a large-context compactor, while smaller sess
 ## Install
 
 ```bash
-pi install git:github.com/baladithyab/pi-compaction-router
+pi install git:github.com/Codeseys-Labs/pi-compaction-router
 ```
 
 ## Configure
