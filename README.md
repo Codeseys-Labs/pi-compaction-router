@@ -50,8 +50,8 @@ Add `compactionRouter` to global `~/.pi/agent/settings.json` or trusted project 
 ```
 
 - The first matching route wins.
-- `models` at the router root is the fallback route.
-- Each model is tried in order. If all fail, the extension returns control to Pi's native active-model handler.
+- `models` at the router root is the route used when **no** route matches. It is not a second chance after a matched route: if every model in the matched route is skipped or fails, the extension goes straight to Pi's native handler and never tries the root list. This is pinned by a test (`test/routing.test.ts`, "a MATCHED route's exhaustion does not fall through to the root `models` list").
+- Each model **within the selected route** is tried in declaration order. If all fail, the extension returns control to Pi's native active-model handler.
 - Missing models, missing authentication, and models too small for a conservative input estimate are skipped.
 - `overflow` never receives an extra resume turn because Pi already retries the interrupted request.
 
@@ -127,10 +127,41 @@ input/output usage equal to the entry's `usage`. Preserve the session, trace, an
 outside the repository. A trace of `session_before_compact` should show `reason: "manual"` and the
 active model; a later `session_compact` trace should show `fromExtension: true`.
 
-This result does **not** establish routing for 341k–576k-token inputs, automatic `threshold` or
-`overflow` compaction, ordered fallback after an actual provider failure, or the native fallback's
-runtime behavior. The tested input was 481 tokens. Treat any probe that fails before it makes a
+This live result covers a **manual** compaction of a 481-token input on one target. On its own it
+does not establish routing for 341k–576k-token inputs, `threshold` or `overflow` routing, ordered
+fallback, or the native fallback's runtime behaviour. Treat any probe that fails before it makes a
 compaction assertion as a broken probe, not evidence about the router.
+
+### Executed hermetic handler proof
+
+**MEASURED — `bun run check`: 28 tests, 0 fail.** `test/routing.test.ts` drives the
+`session_before_compact` handler to a *returned compaction* with no network and no provider, by
+replacing only the imported `compact` function. It executes what the live proof above could not
+reach cheaply:
+
+- `reason: "threshold"` and `reason: "overflow"` each select their own route and thinking level, and
+  a reason no route claims falls to the root `models` list.
+- Ordered fallback: a first target whose compaction call throws is followed by the **second**
+  target, asserted as an exact attempt sequence; reversing the declaration order reverses the
+  attempts; invalid, unregistered, unauthenticated and too-small targets are skipped in place
+  without a compaction call, each with a distinguishable warning.
+- Exhaustion is loud, never a silent pass-through: no compaction is returned, `ctx.ui.notify` fires
+  at `warning`, and the provider error text is logged.
+- An aborted compaction stops without announcing a fail-open.
+- The previous compaction's `readFiles`/`modifiedFiles` are carried into the routed preparation, and
+  each target receives its own credentials and env.
+
+These controls are proven by mutation, not by passing alone: eight planted defects — ignoring
+`event.reason`, reversing the target order, aborting instead of falling back, returning a fake
+compaction after a throw, silencing the operator notice, dropping the file-operation restore,
+removing the context-window guard, and appending the root `models` list to a matched route — were
+each observed failing this suite and then reverted.
+
+Still **not** established: that Pi's own trigger emits `threshold` at a real context threshold or
+`overflow` on a real provider overflow (that is Pi's code, not this package's); that a real provider
+failure — as opposed to a thrown compaction call at the same seam — produces the same fallback;
+routing for 341k–576k-token inputs; the runtime behaviour of Pi's native handler after this hook
+returns no compaction; and the `session_compact` auto-resume turn.
 
 ## Safety and limitations
 
