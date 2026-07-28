@@ -92,6 +92,46 @@ After successful compaction, the extension injects a visible custom continuation
 
 Pi does not currently expose an extension API for adding arbitrary fields to the built-in `/settings` menu. Persistent configuration remains reviewable in JSON; the package-owned command is intentionally session-scoped.
 
+## Executed manual-compaction proof (2026-07-28)
+
+**MEASURED — function, not merely registration.** A disposable live session used a session-local
+route from active `amazon-bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0` to
+`amazon-bedrock/global.anthropic.claude-sonnet-5` at `low` thinking, then requested a real
+**manual** compaction. The persisted session has a non-empty compaction entry with
+`fromHook: true`, `tokensBefore: 481`, and usage `input: 302`, `output: 129`. The contemporaneous
+CloudTrail request names `global.anthropic.claude-sonnet-5`; its service completion reports the
+same 302 input / 129 output token pair. This verifies that the hook returned a real summary made
+by the configured target, rather than only proving that this extension's commands register.
+
+The raw evidence is intentionally private: `/tmp/proof/router-proof.md`,
+`/tmp/proof/router-sessions/`, and `/tmp/proof/router-runtime-target-cloudtrail-command.log` on
+the host that ran the proof. The session entry does not persist a provider/model field for a
+compaction. Therefore the assignment of the CloudTrail request to that entry is **INFERRED, high
+confidence** from the single configured target, contiguous timestamps, hook trace, and exactly
+matching usage — it is not claimed as one atomic session field.
+
+### Repeat the bounded proof
+
+Use a disposable project and session directory; do **not** edit a live global settings file. Ensure
+both the active Runtime model and this target are registered and authenticated, create one ordinary
+turn, then apply this session-only configuration:
+
+```text
+/compaction-router-config {"models":[{"model":"amazon-bedrock/global.anthropic.claude-sonnet-5","thinkingLevel":"low"}]}
+```
+
+Request a manual compaction. The postcondition is **not** a successful command return: inspect the
+persisted session for a non-empty `compaction` entry with `fromHook: true`, then query CloudTrail
+for the compaction time window and require a request naming the target model plus a completion with
+input/output usage equal to the entry's `usage`. Preserve the session, trace, and CloudTrail output
+outside the repository. A trace of `session_before_compact` should show `reason: "manual"` and the
+active model; a later `session_compact` trace should show `fromExtension: true`.
+
+This result does **not** establish routing for 341k–576k-token inputs, automatic `threshold` or
+`overflow` compaction, ordered fallback after an actual provider failure, or the native fallback's
+runtime behavior. The tested input was 481 tokens. Treat any probe that fails before it makes a
+compaction assertion as a broken probe, not evidence about the router.
+
 ## Safety and limitations
 
 - Install only one `session_before_compact` owner.
@@ -99,6 +139,7 @@ Pi does not currently expose an extension API for adding arbitrary fields to the
 - The package performs no direct network or subprocess operations; model calls go through Pi's model registry and native compaction function.
 - The context-fit estimate intentionally overestimates code-heavy input but is not exact provider tokenization.
 - Model fallback after a failed provider call can incur partial provider cost.
+- If every configured target is skipped or throws, the hook warns and returns control to Pi's native active-model handler: this is **fail-open**, not fail-closed.
 - Automatic resume does not prove that unfinished work exists; leave it disabled if strict turn control matters.
 
 ## Development
