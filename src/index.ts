@@ -56,6 +56,25 @@ export default function compactionRouter(pi: ExtensionAPI): void {
       }
     }
     warn("No routed model succeeded; falling back to Pi's active model and native handler.");
+    // The fallback is deliberately FAIL-OPEN: refusing to compact would end the session, which is a worse
+    // outcome than compacting with the active model. But fail-open must not mean unobserved. console.warn
+    // goes to a stream the interactive TUI does not surface, so before this call an operator could watch
+    // every routed target be skipped and see nothing at all -- the compaction would just happen on the
+    // wrong model and look entirely normal. ctx.ui.notify is the operator-visible channel
+    // (docs/extensions.md:67,166,728), so the one outcome that silently changes which model wrote a
+    // summary now announces itself. Optional-chained because a non-interactive host may expose no ui, and
+    // wrapped because a failed notification must never break a compaction: the summary matters more than
+    // its notice.
+    try {
+      ctx.ui?.notify?.(
+        `[${TAG}] compaction was NOT routed: all ${targets.length} configured target(s) were skipped or ` +
+          `failed, so Pi's active model handled it instead. An unavailable, unauthenticated or too-small ` +
+          `target is a configuration problem rather than a transient one.`,
+        "warning",
+      );
+    } catch {
+      // deliberately swallowed; see above
+    }
     return;
   });
 
