@@ -14,7 +14,8 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "check": "bun run typecheck && bun run test && bun run secrets",
+    "check:suites": "bun scripts/check-suite-coverage.ts",
+    "check": "bun run typecheck && bun run check:suites && bun run test && bun run secrets",
     "prepublishOnly": "bun run check",
     "secrets": "betterleaks dir .",
     "secrets:history": "betterleaks git ."
