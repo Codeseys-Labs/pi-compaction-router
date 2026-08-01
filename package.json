@@ -1,6 +1,7 @@
 {
   "name": "pi-compaction-router",
   "version": "0.2.1",
+  "private": true,
   "description": "Route Pi native compaction across configured models with safe fallback and optional post-compaction resume.",
   "license": "MIT",
   "author": "Baladithya B.",
@@ -46,9 +47,6 @@
   "homepage": "https://github.com/Codeseys-Labs/pi-compaction-router#readme",
   "bugs": {
     "url": "https://github.com/Codeseys-Labs/pi-compaction-router/issues"
-  },
-  "publishConfig": {
-    "access": "public"
   },
   "packageManager": "bun@1.3.14"
 }
