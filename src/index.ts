@@ -79,9 +79,26 @@ function restorePreviousFileOperations(preparation: { fileOps: { read: Set<strin
  * (`dist/core/compaction/utils.js:75, 128-133`). On a code-agent history, which is mostly large tool
  * results, the two diverge without bound.
  *
- * Still an over-estimate, and deliberately so: this is a fit guard, not billing tokenization. The
- * prompt scaffolding (the `<conversation>` wrapper, the summarization prompt, the system prompt) is
- * a few hundred tokens and sits inside `reserveTokens`, which the caller adds on top.
+ * NOT an over-estimate. This comment used to claim it was one -- "still an over-estimate, and
+ * deliberately so", with the prompt scaffolding (the `<conversation>` wrapper, the summarization
+ * prompt, the system prompt) dismissed as a few hundred tokens. The 2026-08-03 scale proof measured
+ * that and refuted it: on a 268 640-token tool-heavy history against one Bedrock target, this
+ * function returned 58 295 against a provider-reported input of 69 323. chars/4 UNDER-counts that
+ * provider's tokenization by ~16% -- an 11 028-token shortfall, not a few hundred. pi's own
+ * heuristic is not conservative against every tokenizer on this content.
+ *
+ * The guard is still sound, and `reserveTokens` (16 384 by pi's default) is the whole reason: the
+ * caller adds it on top, and 58 295 + 16 384 = 74 679 > 69 323. A dependency, not a coincidence.
+ * Raising the reserve stays safe; LOWERING it toward this estimate's error -- or overriding it per
+ * target -- silently converts the guard from sound to one that admits prompts which overflow. This
+ * is still a fit guard and not billing tokenization, but its margin now lives in the caller's
+ * reserve rather than here.
+ *
+ * Measurement: `docs/runtime-evidence/2026-08-03-scale-proof.json`, `estimatorAccuracy` block, which
+ * `test/scale-proof-evidence.test.ts` re-asserts from those bytes on every `bun run check` -- so this
+ * direction cannot quietly rot back. The live constraint that disclosure created --
+ * pick a deliberate safety multiplier, assert a floor on `reserveTokens`, or vendor a real tokenizer
+ * -- is seed pi-lab-83ee, open. README "Safety and limitations" carries the same correction.
  */
 function estimatedInputTokens(preparation: Pick<Preparation, "messagesToSummarize" | "turnPrefixMessages" | "previousSummary">): number {
   const serialized = (messages: SummarizedMessages): number => messages.length === 0 ? 0 : serializeConversation(convertToLlm(messages)).length;
