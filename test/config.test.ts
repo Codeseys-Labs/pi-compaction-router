@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { configToSettingsValue, globMatch, parseModelReference, parseSessionOverride, resolveConfig, selectTargets } from "../src/config.js";
+import { configToSettingsValue, globMatch, parseModelReference, parseSessionOverride, resolveConfig } from "../src/config.js";
+// `selectTargets` moved to src/selection.ts in W2, where it returns `{fire, reasons, suppressor}`.
+import { selectTargets } from "../src/selection.js";
 
 const target = { model: "anthropic/claude-sonnet-4-5", thinkingLevel: "low" as const };
 
@@ -44,8 +46,8 @@ describe("routing", () => {
   });
   test("uses a reason-compatible route and otherwise defaults", () => {
     const config = resolveConfig({ compactionRouter: { models: [target], routes: [{ match: "openai-codex/*", reasons: ["threshold"], models: [{ model: "openai/gpt" }] }] } }, {})!;
-    expect(selectTargets(config, "openai-codex/gpt-5", "threshold")[0]?.model).toBe("openai/gpt");
-    expect(selectTargets(config, "openai-codex/gpt-5", "manual")[0]?.model).toBe(target.model);
+    expect(selectTargets(config, "openai-codex/gpt-5", "threshold").fire[0]?.model).toBe("openai/gpt");
+    expect(selectTargets(config, "openai-codex/gpt-5", "manual").fire[0]?.model).toBe(target.model);
   });
   test("parses provider/model while retaining model slashes", () => expect(parseModelReference("bedrock/us/model/id")).toEqual({ provider: "bedrock", modelId: "us/model/id" }));
 });
