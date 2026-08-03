@@ -20,3 +20,61 @@ against this project's own pinned @earendil-works/pi-coding-agent 0.81.1 rather 
 adopted on the upstream author's word. Nothing else from that project is used here: its
 WebSocket transport, provider takeover, Codex identity headers and remote-compaction
 protocol are all out of scope for a router.
+
+This project also adapts portions of Accordion:
+https://github.com/a-Fig/Accordion
+Copyright (c) 2026 Accordion contributors, licensed under the MIT License.
+Read at commit dc037bcdc2929b15bf8e3df2875260d596e258ea -- a clone of the repository at
+that commit, never the published @a-fig/accordion tarball, which predates this code and
+does not contain it at all.
+
+The compaction ledger's closed outcome taxonomy in src/ledger.ts -- the LedgerOutcome
+union and the "never silent" rule that every committed compaction gets a row naming
+exactly one cause, including the `unobserved` case for a compaction our own hook never
+resolved -- is adapted from that project's extension/accordion.ts:385-457
+(`recordPlanOutcome` and its `PlanOutcomeCause` union). The cause names themselves are
+not reused: upstream's describe a GUI round-trip, ours describe route resolution.
+Upstream counts causes in memory and acknowledges them over a WebSocket; this project
+persists a row per compaction instead. Nothing else from Accordion is used here -- its
+fidelity ladder, fold/digest engine, Tauri GUI, WebSocket transport and `context`-hook
+interception are all out of scope for a router.
+
+This project also adapts portions of AFT:
+https://github.com/cortexkit/aft
+Copyright (c) 2025 Ufuk Altinok, licensed under the MIT License.
+Read at commit 566bcde25cbb2c24f09fdc5e4840a58a65a97677.
+
+Two mechanisms in src/ledger.ts are taken from that project:
+
+  - The tokenize-cost cap and its honest skip flag, from
+    crates/aft/src/bash_background/registry.rs:64 (TOKENIZE_CAP_BYTES_PER_STREAM =
+    128 * 1024) and :4438-4452 (CompletionTokenCounts::skipped()). The constant keeps
+    upstream's value and the discriminated null-count-plus-flag shape is upstream's, as is
+    the rule it encodes: never fabricate a count when you declined to compute one.
+  - The savings telemetry and its status surface, from
+    packages/aft-bridge/src/format.ts:24-28 (compressionSavingsPercent, including both
+    edge cases upstream's own tests pin -- a zero original returns null, a negative saving
+    clamps to zero), packages/aft-bridge/src/protocol.ts:43-53 (the two-scope
+    session/project aggregate shape) and packages/pi-plugin/src/dialogs/status-dialog.ts:
+    317-341 (the rendered scope-header-plus-stat-lines layout).
+
+AFT's vendored Rust Claude tokenizer (crates/aft-tokenizer/) is deliberately NOT taken;
+docs/estimator-upgrade-decision.md records that decision and what a future vendoring
+would owe. AFT's type-erasing `pi.on` casts are recorded as an anti-pattern and avoided.
+
+This project also adapts portions of ai-memory:
+https://github.com/akitaonrails/ai-memory
+Copyright (c) 2026 Fabio Akita, licensed under the MIT License.
+Read at commit e714d992993b5ee76a76e09e64ac5cb441e14aed -- a clone of the repository, never
+`npm:ai-memory`, which is an unrelated 1.0.0 stub with no repository field.
+
+The passive provider-health record in src/provider-health.ts is adapted from that project's
+crates/ai-memory-llm/src/health.rs, whose module documentation states the rule this file
+holds to: "These wrappers never probe providers on their own. They only record the result
+of calls the server was already going to make." Taken with it: the status ladder, the
+last-call / last-success / last-error triple, error-message truncation at a named constant,
+the rule that a success clears the previous error rather than leaving a stale one beside it,
+and the snapshot-as-wire-format split. Upstream's provider-role decorator becomes a
+per-target record here, because a route chain is a list of targets rather than a pair of
+roles. Upstream's daemon substrate, embedding provider, consolidation prompts and eval
+harness are not used.

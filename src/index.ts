@@ -1,6 +1,8 @@
-import { compact, convertToLlm, serializeConversation, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
+import { compact, convertToLlm, getAgentDir, serializeConversation, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionCompactEvent } from "@earendil-works/pi-coding-agent";
 import { configToSettingsValue, loadConfig, loadRetryPolicy, parseModelReference, parseSessionOverride, selectTargets, type CompactionReason, type RouterConfig } from "./config.js";
+import { ACTIVE_MODEL_TARGET, appendRow, clearRouteRecord, estimateSummaryTokens, formatSavingsRows, readSavings, setRouteRecord, takeRouteRecord, type LedgerRow, type RouteRecord, type ServingTarget } from "./ledger.js";
 import { clearPendingWarning, setPendingWarning, takePendingWarning } from "./pending-warning.js";
+import { formatHealthRows, ProviderHealth } from "./provider-health.js";
 
 /** Pi's `CompactionPreparation`, reached through the event that carries it rather than re-declared. */
 type Preparation = SessionBeforeCompactEvent["preparation"];
@@ -73,9 +75,55 @@ function clearNotRoutedWidget(ctx: Pick<ExtensionContext, "ui">): void {
   }
 }
 
+/**
+ * Assemble and append one ledger row for a compaction pi has just committed.
+ *
+ * `record` is the before-hook's half of the row (outcome, serving target, window). `undefined` means
+ * our before-hook never resolved for this compaction -- a native path, another extension's handler,
+ * or a config change between the two events. That case is recorded as `unobserved` rather than
+ * skipped, which is the "never silent" rule from Accordion `dc037bc` (see src/ledger.ts): an absent
+ * row and a fell-back row are different facts, and a ledger that cannot distinguish them is not a
+ * meter.
+ *
+ * `tokensBefore` comes from the committed entry rather than the stash, because the entry is what pi
+ * actually saved; the stash's copy is only the fallback for the `unobserved` case.
+ */
+function writeLedgerRow(
+  event: Pick<SessionCompactEvent, "reason" | "willRetry" | "fromExtension" | "compactionEntry">,
+  ctx: Pick<ExtensionContext, "cwd">,
+  record: RouteRecord | undefined,
+  sessionId: string,
+): void {
+  const entry = event.compactionEntry;
+  const summary = typeof entry?.summary === "string" ? entry.summary : "";
+  const { tokens, skipped } = estimateSummaryTokens(summary);
+  const servedBy: ServingTarget = record?.servedBy ?? ACTIVE_MODEL_TARGET;
+  const row: LedgerRow = {
+    ts: new Date().toISOString(),
+    sessionId,
+    project: ctx.cwd,
+    reason: event.reason,
+    willRetry: event.willRetry,
+    fromExtension: event.fromExtension,
+    outcome: record?.outcome ?? "unobserved",
+    servedBy,
+    tokensBefore: typeof entry?.tokensBefore === "number" ? entry.tokensBefore : record?.tokensBefore ?? 0,
+    tokensAfter: tokens,
+    tokensSkipped: skipped,
+    window: record?.window ?? null,
+    usage: entry?.usage ?? null,
+  };
+  appendRow(getAgentDir(), row, warn);
+}
+
 export default function compactionRouter(pi: ExtensionAPI): void {
   const explicitResumeSessions = new Set<string>();
   const sessionOverrides = new Map<string, RouterConfig | null>();
+  /**
+   * Passive only. Fed exclusively from results the route loop below already obtained; never consulted
+   * by asking a provider anything. See src/provider-health.ts for the upstream rule this holds to.
+   */
+  const health = new ProviderHealth();
   const configFor = (ctx: Parameters<typeof loadConfig>[0]): RouterConfig | null => {
     const sessionId = ctx.sessionManager.getSessionId();
     return sessionOverrides.has(sessionId) ? sessionOverrides.get(sessionId)! : loadConfig(ctx);
@@ -88,12 +136,21 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     // describes a compaction this one supersedes.
     clearPendingWarning(sessionId);
     clearNotRoutedWidget(ctx);
+    // Same reason as the warning stash above: a route decision from a compaction that never reached
+    // session_compact must not be attributed to this one.
+    clearRouteRecord(sessionId);
 
+    const tokensBefore = event.preparation.tokensBefore;
     const config = configFor(ctx);
     if (!config) return;
     const active = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown/unknown";
     const targets = selectTargets(config, active, event.reason);
-    if (!targets.length) return;
+    // "Never silent": configuration exists but nothing matched this reason and active model. That is
+    // a fact about routing, so it is recorded rather than being an absent row a reader must guess at.
+    if (!targets.length) {
+      setRouteRecord(sessionId, { outcome: "no-targets", servedBy: ACTIVE_MODEL_TARGET, window: ctx.model?.contextWindow ?? null, tokensBefore });
+      return;
+    }
 
     restorePreviousFileOperations(event.preparation, event.branchEntries);
     const estimated = estimatedInputTokens(event.preparation);
@@ -108,23 +165,41 @@ export default function compactionRouter(pi: ExtensionAPI): void {
       const ref = parseModelReference(target.model);
       if (!ref) { warn(`Skipping invalid model '${target.model}'.`); continue; }
       const model = ctx.modelRegistry.find(ref.provider, ref.modelId);
-      if (!model) { warn(`Skipping unavailable model '${target.model}'.`); continue; }
+      // Every `health.record*` call below sits AFTER the thing it records, and describes only that
+      // thing. Nothing here asks a provider a question in order to have something to record.
+      if (!model) { health.recordFailure(target.model, "unavailable"); warn(`Skipping unavailable model '${target.model}'.`); continue; }
       const reserve = event.preparation.settings.reserveTokens;
       if (estimated + reserve > model.contextWindow) {
+        health.recordFailure(target.model, "too-small", `${estimated}-token estimate plus ${reserve} reserved exceeds a ${model.contextWindow}-token window`);
         warn(`Skipping '${target.model}': conservative ${estimated}-token input estimate plus ${reserve} reserved tokens exceeds its ${model.contextWindow}-token context window.`);
         continue;
       }
       try {
         const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-        if (!auth.ok) { warn(`Skipping unauthenticated model '${target.model}': ${auth.error}.`); continue; }
+        if (!auth.ok) { health.recordFailure(target.model, "unauthenticated", auth.error); warn(`Skipping unauthenticated model '${target.model}': ${auth.error}.`); continue; }
         // Arg 10 is `retry`. Pi passes its own `settingsManager.getRetrySettings()` on both native
         // compaction paths (`dist/core/agent-session.js:1423`, `1662`); omitting it here meant a
         // routed compaction was the one summarization call in the process with retry disabled, so a
         // single transient stream drop cost the whole route hop where pi would have retried.
         const result = await compact(event.preparation, model, auth.apiKey, auth.headers, event.customInstructions, event.signal, target.thinkingLevel, undefined, auth.env, retry);
+        health.recordSuccess(target.model);
+        // WHICH TARGET SERVED IT -- the field pi's own compaction entry does not carry. Stashed for
+        // session_compact, which owns the other half of the row (reason, willRetry, committed usage).
+        setRouteRecord(sessionId, {
+          outcome: "routed",
+          servedBy: { model: target.model, thinkingLevel: target.thinkingLevel, active: false },
+          window: model.contextWindow,
+          tokensBefore,
+        });
         return { compaction: result };
       } catch (error) {
-        if (event.signal.aborted) return;
+        if (event.signal.aborted) {
+          // An abort is not a target failure: the target never got the chance to fail. Recording it
+          // as one would make an aborted session look like a flapping provider to W2's selection.
+          setRouteRecord(sessionId, { outcome: "aborted", servedBy: ACTIVE_MODEL_TARGET, window: ctx.model?.contextWindow ?? null, tokensBefore });
+          return;
+        }
+        health.recordFailure(target.model, "call-failed", error instanceof Error ? error.message : String(error));
         warn(`Compaction with '${target.model}' failed; trying the next route target.`, error);
       }
     }
@@ -143,6 +218,12 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     //
     // Nothing is aborted if this stash never gets drained: an unemitted warning is a lost notice, not
     // a broken compaction.
+    setRouteRecord(sessionId, {
+      outcome: event.signal.aborted ? "aborted" : "fell-back",
+      servedBy: ACTIVE_MODEL_TARGET,
+      window: ctx.model?.contextWindow ?? null,
+      tokensBefore,
+    });
     if (!event.signal.aborted) {
       setPendingWarning(sessionId, {
         lines: [
@@ -158,6 +239,13 @@ export default function compactionRouter(pi: ExtensionAPI): void {
 
   pi.on("session_compact", (event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
+
+    // The ledger row is written here, not in the before-hook, because this is the first point at
+    // which the compaction is a FACT rather than an intention -- and because `reason`, `willRetry`
+    // and the committed `usage` exist only on this event. Written before the resume decision below,
+    // which returns early on several paths: a meter that only records the compactions that also
+    // triggered a nudge is not a meter.
+    writeLedgerRow(event, ctx, takeRouteRecord(sessionId), sessionId);
 
     // The compaction is committed by the time this fires, so the stashed warning can be checked
     // against the entry pi actually saved. `fromExtension` is pi's own record of whether a
@@ -197,7 +285,16 @@ export default function compactionRouter(pi: ExtensionAPI): void {
       const active = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown/unknown";
       const lines = (["manual", "threshold", "overflow"] as CompactionReason[]).map(reason => `${reason}: ${selectTargets(config, active, reason).map(x => `${x.model}${x.thinkingLevel ? `:${x.thinkingLevel}` : ""}`).join(" -> ") || "Pi active model"}`);
       const source = sessionOverrides.has(sessionId) ? "session override" : "settings";
-      ctx.ui.notify(`Active: ${active}\nSource: ${source}\n${lines.join("\n")}\nAuto-resume: ${config.resume.reasons.join(", ") || "off"}`, "info");
+      // This command showed CONFIGURATION only. Configuration is what routing was ASKED to do; the
+      // savings block below is what it actually did -- the meter for "what did routing buy" (AFT
+      // 566bcde stealList 4). Both blocks degrade to nothing rather than to a row of zeroes: before
+      // any compaction has been measured there is no honest number to show.
+      const meter = formatSavingsRows(readSavings(getAgentDir(), sessionId, ctx.cwd));
+      const healthRows = formatHealthRows(health.snapshotAll());
+      const blocks = [`Active: ${active}`, `Source: ${source}`, ...lines, `Auto-resume: ${config.resume.reasons.join(", ") || "off"}`];
+      if (meter.length) blocks.push("", ...meter);
+      if (healthRows.length) blocks.push("", ...healthRows);
+      ctx.ui.notify(blocks.join("\n"), "info");
     },
   });
 
@@ -234,9 +331,12 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     sessionOverrides.delete(sessionId);
     // A warning about the old session must not be stashed against, or shown over, the next one.
     clearPendingWarning(sessionId);
+    clearRouteRecord(sessionId);
     clearNotRoutedWidget(ctx);
   });
 }
 
 export * from "./config.js";
+export * from "./ledger.js";
 export * from "./pending-warning.js";
+export * from "./provider-health.js";

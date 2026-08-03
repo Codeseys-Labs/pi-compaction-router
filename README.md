@@ -86,11 +86,67 @@ After successful compaction, the extension injects a visible custom continuation
 
 ## Commands
 
-- `/compaction-router` — show active model, configuration source, routes, fallback order, thinking levels, and auto-resume policy.
+- `/compaction-router` — show active model, configuration source, routes, fallback order, thinking levels, auto-resume policy, and — once anything has been compacted — the savings meter and per-target health.
 - `/compaction-router-config [off|reset|JSON]` — edit or replace the current session's routing policy.
 - `/compact-resume [instructions]` — compact and explicitly continue.
 
 Pi does not currently expose an extension API for adding arbitrary fields to the built-in `/settings` menu. Persistent configuration remains reviewable in JSON; the package-owned command is intentionally session-scoped.
+
+## The compaction ledger and the savings meter
+
+Pi's persisted compaction entry records no `reason` and no serving model: `reason` exists only on the
+live event, and `fromHook` says *that* an extension produced the summary, never *which model did*. So
+"did threshold compaction ever fire here", "was this summary routed" and "what did it cost" were
+unanswerable from the record.
+
+Every committed compaction now appends one JSON line to
+`$PI_CODING_AGENT_DIR/compaction-router/ledger.jsonl` (default `~/.pi/agent/...`), carrying `reason`,
+`willRetry`, `fromExtension`, `tokensBefore`, the summary's estimated `tokensAfter`, the serving
+model's context `window`, the reported `usage`, a closed `outcome`, and **`servedBy` — which target
+served it**.
+
+`outcome` is a closed taxonomy, and every committed compaction gets a row:
+
+| outcome | meaning |
+|---|---|
+| `routed` | a configured target produced the summary; `servedBy.model` names it |
+| `fell-back` | every target was skipped or failed, so Pi's active model served it |
+| `no-targets` | configuration exists, but nothing matched this reason and active model |
+| `aborted` | the caller aborted; nothing was committed through the router |
+| `unobserved` | Pi committed a compaction the router's before-hook never resolved |
+
+`unobserved` is the reason the taxonomy is worth having: an **absent** row and a **fell-back** row are
+different facts, and a ledger that cannot tell them apart would let a reader conclude "routing was
+never asked" from evidence that only says "the decision was not observed".
+
+`/compaction-router` reads that file back as a session and project savings meter. Two honesty
+properties are deliberate:
+
+- **A summary larger than 128 KiB is not measured.** The row carries `tokensAfter: null` and
+  `tokensSkipped: true`, the event is excluded from the totals, and the surface reports the exclusion
+  as `Not measured`. A declined measurement is never reported as a zero-cost summary.
+- **The meter separates routed from total.** `Compactions 3 (1 routed)` — savings from a fell-back
+  compaction are real but are not routing's doing, and crediting them to routing would make the meter
+  flatter the feature it measures.
+
+The ledger rotates at 1 MiB keeping one generation, and a ledger that cannot be written is a lost
+measurement rather than a failed compaction.
+
+## Provider health is recorded, never probed
+
+`/compaction-router` also shows per-target health — the outcome of the last call to each target the
+router actually made. Nothing here probes: no warm-up, no reachability check, no timer, no call of its
+own. A target acquires a status only by having been used, and a configured target that has never been
+reached does not appear at all.
+
+This matters because targets are paid endpoints and compaction fires on a hook the operator did not
+initiate: a probe would spend real money and quota to learn what the next real compaction reports for
+free, for targets that may never be used. `test/provider-health.test.ts` enforces it by driving every
+handler and command the extension registers and asserting that only `session_before_compact` ever
+reaches the model registry.
+
+The record is currently an input for future target deprioritisation, not a decision: nothing here
+reorders a route chain today.
 
 ## Executed manual-compaction proof (2026-07-28)
 
@@ -136,7 +192,8 @@ compaction assertion as a broken probe, not evidence about the router.
 
 - Install only one `session_before_compact` owner.
 - Routed models use credentials already registered with Pi.
-- The package performs no direct network or subprocess operations; model calls go through Pi's model registry and native compaction function.
+- The package performs no direct network or subprocess operations; model calls go through Pi's model registry and native compaction function. Its only write is the append-only ledger under `$PI_CODING_AGENT_DIR/compaction-router/`, and a failed ledger write is swallowed after one warning rather than failing the compaction.
+- The ledger records the summary's *size*, never its text, and no message content. It does record the project path and the configured target names.
 - The context-fit estimate still rounds up (characters ÷ 4, the same heuristic Pi uses) and is not exact provider tokenization. It is a fit guard, not billing.
 - Model fallback after a failed provider call can incur partial provider cost.
 - Routed compactions are passed the host's own `settings.retry` policy, so a transient stream drop is retried before the route advances — the same policy Pi's native compaction runs with.
@@ -152,4 +209,4 @@ bun run check
 
 ## Attribution
 
-The native compaction integration and restoration of prior file-operation details are adapted from [JMHSV/pi-compaction-model](https://github.com/JMHSV/pi-compaction-model), MIT licensed. See [`NOTICE`](./NOTICE) and [`LICENSE`](./LICENSE).
+The native compaction integration and restoration of prior file-operation details are adapted from [JMHSV/pi-compaction-model](https://github.com/JMHSV/pi-compaction-model), MIT licensed. The ledger's closed outcome taxonomy is adapted from [a-Fig/Accordion](https://github.com/a-Fig/Accordion); the tokenize-cost cap, the honest skip flag and the savings telemetry from [cortexkit/aft](https://github.com/cortexkit/aft); the passive provider-health record from [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory). All MIT licensed, all read at pinned commits rather than published tarballs. See [`NOTICE`](./NOTICE) and [`LICENSE`](./LICENSE) for the commit SHAs and the precise scope of each adaptation.
