@@ -1,5 +1,5 @@
 import { compact, convertToLlm, serializeConversation, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
-import { configToSettingsValue, loadConfig, parseModelReference, parseSessionOverride, selectTargets, type CompactionReason, type RouterConfig } from "./config.js";
+import { configToSettingsValue, loadConfig, loadRetryPolicy, parseModelReference, parseSessionOverride, selectTargets, type CompactionReason, type RouterConfig } from "./config.js";
 import { clearPendingWarning, setPendingWarning, takePendingWarning } from "./pending-warning.js";
 
 /** Pi's `CompactionPreparation`, reached through the event that carries it rather than re-declared. */
@@ -97,6 +97,12 @@ export default function compactionRouter(pi: ExtensionAPI): void {
 
     restorePreviousFileOperations(event.preparation, event.branchEntries);
     const estimated = estimatedInputTokens(event.preparation);
+    // Read once per compaction, not once per target: this is a settings file read, and a route chain
+    // must not re-read it per hop. Hoisted out of the loop below for a second reason -- inside the
+    // try/catch it would report a settings failure as "compaction with this target failed", sending
+    // the operator after the wrong thing. `configFor` above already read the same file, so this adds
+    // no failure mode that was not already present.
+    const retry = loadRetryPolicy(ctx);
 
     for (const target of targets) {
       const ref = parseModelReference(target.model);
@@ -111,7 +117,11 @@ export default function compactionRouter(pi: ExtensionAPI): void {
       try {
         const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
         if (!auth.ok) { warn(`Skipping unauthenticated model '${target.model}': ${auth.error}.`); continue; }
-        const result = await compact(event.preparation, model, auth.apiKey, auth.headers, event.customInstructions, event.signal, target.thinkingLevel, undefined, auth.env);
+        // Arg 10 is `retry`. Pi passes its own `settingsManager.getRetrySettings()` on both native
+        // compaction paths (`dist/core/agent-session.js:1423`, `1662`); omitting it here meant a
+        // routed compaction was the one summarization call in the process with retry disabled, so a
+        // single transient stream drop cost the whole route hop where pi would have retried.
+        const result = await compact(event.preparation, model, auth.apiKey, auth.headers, event.customInstructions, event.signal, target.thinkingLevel, undefined, auth.env, retry);
         return { compaction: result };
       } catch (error) {
         if (event.signal.aborted) return;

@@ -1,4 +1,5 @@
 import { getAgentDir, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { RetryPolicy } from "@earendil-works/pi-ai";
 
 export const REASONS = ["manual", "threshold", "overflow"] as const;
 export type CompactionReason = (typeof REASONS)[number];
@@ -60,6 +61,18 @@ export function resolveConfig(globalSettings: unknown, projectSettings: unknown,
 export function loadConfig(ctx: ExtensionContext): RouterConfig | null {
   const s = SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted: ctx.isProjectTrusted() });
   return resolveConfig(s.getGlobalSettings(), ctx.isProjectTrusted() ? s.getProjectSettings() : undefined);
+}
+
+/**
+ * The host's own `settings.retry` policy, for the `retry` argument of `compact()`.
+ *
+ * This is not our config surface: it is pi's, read through the same `SettingsManager` `loadConfig`
+ * builds and returned in the exact `{enabled, maxRetries, baseDelayMs}` shape `compact()` expects.
+ * `getRetrySettings()` applies pi's defaults, so a host that never set `retry` gets what pi's own
+ * compaction gets. Read-only: nothing here writes settings.
+ */
+export function loadRetryPolicy(ctx: ExtensionContext): RetryPolicy {
+  return SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted: ctx.isProjectTrusted() }).getRetrySettings();
 }
 
 export function configToSettingsValue(config: RouterConfig | null): false | Rec {
