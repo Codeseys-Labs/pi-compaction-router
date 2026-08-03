@@ -88,9 +88,19 @@ roles. Upstream's daemon substrate, embedding provider, consolidation prompts an
 harness are not used.
 
 This project also adapts portions of pi-blackhole:
-https://github.com/JMHSV/pi-blackhole
-Copyright (c) 2026 the pi-blackhole authors, licensed under the MIT License.
+https://github.com/k0valik/pi-blackhole
+Copyright (c) 2026 k0valik, licensed under the MIT License.
 Read at commit 2bf8cda11585c21fef2e5c2d9210690d82a2f2ca -- not from a published tarball.
+
+CORRECTED 2026-08-03. This block previously named the repository as
+https://github.com/JMHSV/pi-blackhole and the holder as "the pi-blackhole authors".
+Both were wrong and the first was unresolvable: that URL returns HTTP 404, and the
+repository the dive actually cloned and read is k0valik/pi-blackhole
+(docs/research/compaction-v2/dive-pi-blackhole.md:16-17 records the clone command and
+this same HEAD). Re-verified by cloning k0valik/pi-blackhole at
+2bf8cda11585c21fef2e5c2d9210690d82a2f2ca, whose LICENSE reads "MIT License,
+Copyright (c) 2026 k0valik". An attribution nobody can follow to a real repository is
+not an attribution, which is why this is corrected rather than left as cosmetic.
 
 src/cooldown.ts adapts that project's src/om/cooldown.ts: the {until, reason, stage} entry
 shape, the agent-dir-relative JSON file, expiry-on-read, expireCooldowns, and the
@@ -103,15 +113,47 @@ convention this file's siblings follow is also that project's practice. Not take
 extractive compile() pipeline, its observational-memory ledger and background workers, and
 its settings TUI.
 
-This project also adapts a mechanism from pi-magic-context:
-https://github.com/cortexkit/pi-magic-context
-Copyright (c) 2026 cortexkit, licensed under the MIT License.
+effectiveContextWindow in src/selection.ts, and the ModelTarget.contextWindow field it reads,
+adapt that project's src/om/model-budget.ts:15-41 (effectiveContextWindow) and its
+OmModelConfig.contextWindow (src/core/unified-config.ts:62-63, "Context window override for
+this model. Inherits from Pi's model registry when unset"). The mechanism taken is the
+resolution ORDER -- a per-model config override wins over the registry's value -- and the
+purpose the dive named for it: let an operator correct a model whose registry-reported window
+is wrong, rather than having the context-fit guard skip a target on bad metadata. Upstream's
+positive-integer parsing of the field is also followed, which is why 0 is rejected here even
+though cooldownHours: 0 is honoured. Upstream's THIRD resolution step, a hardcoded 128 000
+fallback, is deliberately NOT taken: this package's whole question at that point is whether a
+prompt fits, and inventing a window would let it route on no evidence. 0 means unknown here,
+and unknown does not fit.
+
+This project also adapts mechanisms from Magic Context:
+https://github.com/cortexkit/magic-context
+Copyright (c) 2025 ualtinok, licensed under the MIT License.
 Read at commit 7d2230612a22d28f01c38d88e2578cb0c0ffaf2c -- not from a published tarball.
+
+CORRECTED 2026-08-03, the same defect as the pi-blackhole block above and for the same
+reason. This block previously named https://github.com/cortexkit/pi-magic-context, which
+returns HTTP 404, and gave the holder as "cortexkit". The repository the dive cloned is
+cortexkit/magic-context (docs/research/compaction-v2/dive--cortexkit-pi-magic-context.md:16),
+and its LICENSE at this commit reads "MIT License, Copyright (c) 2025 ualtinok" -- so both
+the URL and the holder were wrong. Re-verified by cloning that repository at this commit.
 
 src/chain.ts adapts the isFallbackEligible rule from that project's
 packages/pi-plugin/src/subagent-runner.ts: advance a fallback chain only on an explicit
 allow-list of failure classes, and stop on anything else, so a failure that travels with the
 request cannot burn the whole model list. The failure vocabulary is this project's own.
+
+src/collision.ts and test/collision.test.ts adapt two things from that project, neither of
+them a line of its code. From packages/pi-plugin/src/fail-closed-pi.test.ts, the
+createFakePi() shape: a fake `pi` whose `on()` accumulates handlers into a
+Map<string, Handler[]> and whose `emit()` runs the whole list, which is what makes "exactly
+one session_before_compact handler" an assertion about the registered SET rather than about
+one handler's return value. And the finding that makes the assertion necessary: Pi's
+dispatcher runs every registered handler, keeps the last truthy result, and short-circuits
+on {cancel: true}, so two owners of that hook are mutually destructive and load order
+decides. Upstream records the same collision from its own side, in
+packages/e2e-tests/tests/pi-cache-stability.test.ts:576. Upstream's unconditional-cancel
+compaction thesis is NOT taken -- it is the inverse of this package's.
 
 This project also adapts a mechanism from neatcontext-plugins:
 https://github.com/XTSoftwareLabs/neatcontext-plugins
