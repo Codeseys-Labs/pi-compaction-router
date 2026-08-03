@@ -1,8 +1,16 @@
-import { compact, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { configToSettingsValue, loadConfig, parseModelReference, parseSessionOverride, selectTargets, type CompactionReason, type RouterConfig } from "./config.js";
+import { compact, convertToLlm, serializeConversation, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
+import { configToSettingsValue, loadConfig, loadRetryPolicy, parseModelReference, parseSessionOverride, selectTargets, type CompactionReason, type RouterConfig } from "./config.js";
+import { clearPendingWarning, setPendingWarning, takePendingWarning } from "./pending-warning.js";
+
+/** Pi's `CompactionPreparation`, reached through the event that carries it rather than re-declared. */
+type Preparation = SessionBeforeCompactEvent["preparation"];
+type SummarizedMessages = Preparation["messagesToSummarize"];
 
 const TAG = "pi-compaction-router";
 const warn = (message: string, error?: unknown) => error === undefined ? console.warn(`[${TAG}] ${message}`) : console.warn(`[${TAG}] ${message}`, error);
+
+/** Key for the durable not-routed banner. One key, so re-setting it replaces rather than stacks. */
+const NOT_ROUTED_WIDGET_KEY = `${TAG}:not-routed`;
 
 function restorePreviousFileOperations(preparation: { fileOps: { read: Set<string>; edited: Set<string> } }, branchEntries: Array<{ type: string; details?: unknown }>): void {
   const previous = [...branchEntries].reverse().find(entry => entry.type === "compaction");
@@ -12,9 +20,57 @@ function restorePreviousFileOperations(preparation: { fileOps: { read: Set<strin
   if (Array.isArray(details.modifiedFiles)) for (const path of details.modifiedFiles) if (typeof path === "string") preparation.fileOps.edited.add(path);
 }
 
-function estimatedInputTokens(preparation: { messagesToSummarize: unknown[]; turnPrefixMessages: unknown[]; previousSummary?: string }): number {
-  // Deliberately conservative for code-heavy histories. This is a guard, not billing tokenization.
-  return Math.ceil(JSON.stringify([preparation.previousSummary ?? "", preparation.messagesToSummarize, preparation.turnPrefixMessages]).length / 2);
+/**
+ * Estimate the tokens the summarization prompt will actually carry, by measuring the artifact
+ * `compact()` actually sends.
+ *
+ * Upstream: pi itself. `compact()` -> `generateSummaryWithUsage` builds its prompt as
+ * `serializeConversation(convertToLlm(messagesToSummarize))`, and the split-turn arm adds a second
+ * call over `turnPrefixMessages` the same way (`dist/core/compaction/compaction.js:461-462,
+ * 584-588, 618-619`). Both functions are exported from the package, so this reuses pi's own code
+ * rather than reimplementing the primitive.
+ *
+ * This replaces a `JSON.stringify(<message objects>).length / 2` estimate that was measured
+ * 3.7x-37.9x too high across 14 real transcripts, and falsely refused 5 of them at a 272k window --
+ * on the exact tool-heavy sessions routing exists for. Two errors compounded there: chars/2 where
+ * pi's own conservative heuristic is chars/4 (`estimateTokens`,
+ * `dist/core/compaction/compaction.js:188-213`), and measuring the message *objects* -- every JSON
+ * key, quote, escaped newline, toolCallId and timestamp, plus tool results at full length -- when
+ * `serializeConversation` truncates every tool result to `TOOL_RESULT_MAX_CHARS = 2000`
+ * (`dist/core/compaction/utils.js:75, 128-133`). On a code-agent history, which is mostly large tool
+ * results, the two diverge without bound.
+ *
+ * Still an over-estimate, and deliberately so: this is a fit guard, not billing tokenization. The
+ * prompt scaffolding (the `<conversation>` wrapper, the summarization prompt, the system prompt) is
+ * a few hundred tokens and sits inside `reserveTokens`, which the caller adds on top.
+ */
+function estimatedInputTokens(preparation: Pick<Preparation, "messagesToSummarize" | "turnPrefixMessages" | "previousSummary">): number {
+  const serialized = (messages: SummarizedMessages): number => messages.length === 0 ? 0 : serializeConversation(convertToLlm(messages)).length;
+  // previousSummary rides along in the same prompt as a <previous-summary> block, so it counts.
+  const chars = serialized(preparation.messagesToSummarize) + serialized(preparation.turnPrefixMessages) + (preparation.previousSummary?.length ?? 0);
+  return Math.ceil(chars / 4);
+}
+
+/**
+ * Raise the not-routed banner in the widget container, which survives the post-compaction chat
+ * rebuild. Wrapped and optional-chained for the same reason the notify was: a host may expose no ui,
+ * and a failed notice must never be why a compaction breaks.
+ */
+function showNotRoutedWidget(ctx: Pick<ExtensionContext, "ui">, lines: string[]): void {
+  try {
+    ctx.ui?.setWidget?.(NOT_ROUTED_WIDGET_KEY, lines);
+  } catch {
+    // deliberately swallowed; the summary matters more than its notice
+  }
+}
+
+/** Retract the banner, so a warning about an earlier compaction cannot linger past the one it describes. */
+function clearNotRoutedWidget(ctx: Pick<ExtensionContext, "ui">): void {
+  try {
+    ctx.ui?.setWidget?.(NOT_ROUTED_WIDGET_KEY, undefined);
+  } catch {
+    // deliberately swallowed; see above
+  }
 }
 
 export default function compactionRouter(pi: ExtensionAPI): void {
@@ -26,6 +82,13 @@ export default function compactionRouter(pi: ExtensionAPI): void {
   };
 
   pi.on("session_before_compact", async (event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    // Drop a stash from an earlier compaction that never reached session_compact so it cannot
+    // resurface against this one, and retract a banner still standing from a previous fallback: it
+    // describes a compaction this one supersedes.
+    clearPendingWarning(sessionId);
+    clearNotRoutedWidget(ctx);
+
     const config = configFor(ctx);
     if (!config) return;
     const active = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown/unknown";
@@ -34,6 +97,12 @@ export default function compactionRouter(pi: ExtensionAPI): void {
 
     restorePreviousFileOperations(event.preparation, event.branchEntries);
     const estimated = estimatedInputTokens(event.preparation);
+    // Read once per compaction, not once per target: this is a settings file read, and a route chain
+    // must not re-read it per hop. Hoisted out of the loop below for a second reason -- inside the
+    // try/catch it would report a settings failure as "compaction with this target failed", sending
+    // the operator after the wrong thing. `configFor` above already read the same file, so this adds
+    // no failure mode that was not already present.
+    const retry = loadRetryPolicy(ctx);
 
     for (const target of targets) {
       const ref = parseModelReference(target.model);
@@ -48,7 +117,11 @@ export default function compactionRouter(pi: ExtensionAPI): void {
       try {
         const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
         if (!auth.ok) { warn(`Skipping unauthenticated model '${target.model}': ${auth.error}.`); continue; }
-        const result = await compact(event.preparation, model, auth.apiKey, auth.headers, event.customInstructions, event.signal, target.thinkingLevel, undefined, auth.env);
+        // Arg 10 is `retry`. Pi passes its own `settingsManager.getRetrySettings()` on both native
+        // compaction paths (`dist/core/agent-session.js:1423`, `1662`); omitting it here meant a
+        // routed compaction was the one summarization call in the process with retry disabled, so a
+        // single transient stream drop cost the whole route hop where pi would have retried.
+        const result = await compact(event.preparation, model, auth.apiKey, auth.headers, event.customInstructions, event.signal, target.thinkingLevel, undefined, auth.env, retry);
         return { compaction: result };
       } catch (error) {
         if (event.signal.aborted) return;
@@ -58,29 +131,42 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     warn("No routed model succeeded; falling back to Pi's active model and native handler.");
     // The fallback is deliberately FAIL-OPEN: refusing to compact would end the session, which is a worse
     // outcome than compacting with the active model. But fail-open must not mean unobserved. console.warn
-    // goes to a stream the interactive TUI does not surface, so before this call an operator could watch
-    // every routed target be skipped and see nothing at all -- the compaction would just happen on the
-    // wrong model and look entirely normal. ctx.ui.notify is the operator-visible channel
-    // (docs/extensions.md:67,166,728), so the one outcome that silently changes which model wrote a
-    // summary now announces itself. Optional-chained because a non-interactive host may expose no ui, and
-    // wrapped because a failed notification must never break a compaction: the summary matters more than
-    // its notice.
-    try {
-      ctx.ui?.notify?.(
-        `[${TAG}] compaction was NOT routed: all ${targets.length} configured target(s) were skipped or ` +
-          `failed, so Pi's active model handled it instead. An unavailable, unauthenticated or too-small ` +
-          `target is a configuration problem rather than a transient one.`,
-        "warning",
-      );
-    } catch {
-      // deliberately swallowed; see above
+    // goes to a stream the interactive TUI does not surface, so without an operator-visible report an
+    // operator could watch every routed target be skipped and see nothing at all -- the compaction would
+    // just happen on the wrong model and look entirely normal.
+    //
+    // ui.notify was that report, and it did not survive: notify is a child of chatContainer, which pi
+    // clears and rebuilds on compaction_end, strictly after this hook returns. So the warning was
+    // reliably destroyed before an operator could read it, every time, on the success path. It is
+    // stashed here instead and emitted from session_compact as a widget, which lives in a container
+    // the rebuild does not touch. See src/pending-warning.ts for the verified mechanism.
+    //
+    // Nothing is aborted if this stash never gets drained: an unemitted warning is a lost notice, not
+    // a broken compaction.
+    if (!event.signal.aborted) {
+      setPendingWarning(sessionId, {
+        lines: [
+          `[${TAG}] compaction was NOT routed: all ${targets.length} configured target(s) were skipped`,
+          `or failed, so Pi's active model handled it instead. An unavailable, unauthenticated or`,
+          `too-small target is a configuration problem rather than a transient one.`,
+        ],
+        routedByExtension: false,
+      });
     }
     return;
   });
 
   pi.on("session_compact", (event, ctx) => {
-    if (event.willRetry) return; // Pi already resumes overflow recovery.
     const sessionId = ctx.sessionManager.getSessionId();
+
+    // The compaction is committed by the time this fires, so the stashed warning can be checked
+    // against the entry pi actually saved. `fromExtension` is pi's own record of whether a
+    // session_before_compact handler returned the compaction; if it did, this compaction WAS routed
+    // and the warning is stale -- drop it rather than accuse a compaction that went fine.
+    const pending = takePendingWarning(sessionId);
+    if (pending && pending.routedByExtension === event.fromExtension) showNotRoutedWidget(ctx, pending.lines);
+
+    if (event.willRetry) return; // Pi already resumes overflow recovery.
     if (explicitResumeSessions.delete(sessionId)) return;
     const config = configFor(ctx);
     if (!config || !config.resume.reasons.includes(event.reason as CompactionReason)) return;
@@ -146,7 +232,11 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     const sessionId = ctx.sessionManager.getSessionId();
     explicitResumeSessions.delete(sessionId);
     sessionOverrides.delete(sessionId);
+    // A warning about the old session must not be stashed against, or shown over, the next one.
+    clearPendingWarning(sessionId);
+    clearNotRoutedWidget(ctx);
   });
 }
 
 export * from "./config.js";
+export * from "./pending-warning.js";

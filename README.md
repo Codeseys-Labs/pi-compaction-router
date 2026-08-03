@@ -52,7 +52,7 @@ Add `compactionRouter` to global `~/.pi/agent/settings.json` or trusted project 
 - The first matching route wins.
 - `models` at the router root is the fallback route.
 - Each model is tried in order. If all fail, the extension returns control to Pi's native active-model handler.
-- Missing models, missing authentication, and models too small for a conservative input estimate are skipped.
+- Missing models, missing authentication, and models too small to hold the summarization prompt are skipped. The fit check measures the artifact Pi actually sends — `serializeConversation(convertToLlm(...))`, in which every tool result is truncated to 2 000 characters — not the raw message objects.
 - `overflow` never receives an extra resume turn because Pi already retries the interrupted request.
 
 Settings are re-read at every compaction, so global or trusted project changes take effect during the current session without `/reload`.
@@ -137,9 +137,10 @@ compaction assertion as a broken probe, not evidence about the router.
 - Install only one `session_before_compact` owner.
 - Routed models use credentials already registered with Pi.
 - The package performs no direct network or subprocess operations; model calls go through Pi's model registry and native compaction function.
-- The context-fit estimate intentionally overestimates code-heavy input but is not exact provider tokenization.
+- The context-fit estimate still rounds up (characters ÷ 4, the same heuristic Pi uses) and is not exact provider tokenization. It is a fit guard, not billing.
 - Model fallback after a failed provider call can incur partial provider cost.
-- If every configured target is skipped or throws, the hook warns and returns control to Pi's native active-model handler: this is **fail-open**, not fail-closed.
+- Routed compactions are passed the host's own `settings.retry` policy, so a transient stream drop is retried before the route advances — the same policy Pi's native compaction runs with.
+- If every configured target is skipped or throws, the hook returns control to Pi's native active-model handler: this is **fail-open**, not fail-closed. That outcome is reported to the operator as a widget above the editor, raised after the compaction commits and retracted by the next one. It is not a `notify`: Pi clears and rebuilds the chat container on `compaction_end`, which destroys anything the before-hook put there.
 - Automatic resume does not prove that unfinished work exists; leave it disabled if strict turn control matters.
 
 ## Development
