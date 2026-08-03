@@ -1,6 +1,10 @@
-import { compact, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { compact, convertToLlm, serializeConversation, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
 import { configToSettingsValue, loadConfig, parseModelReference, parseSessionOverride, selectTargets, type CompactionReason, type RouterConfig } from "./config.js";
 import { clearPendingWarning, setPendingWarning, takePendingWarning } from "./pending-warning.js";
+
+/** Pi's `CompactionPreparation`, reached through the event that carries it rather than re-declared. */
+type Preparation = SessionBeforeCompactEvent["preparation"];
+type SummarizedMessages = Preparation["messagesToSummarize"];
 
 const TAG = "pi-compaction-router";
 const warn = (message: string, error?: unknown) => error === undefined ? console.warn(`[${TAG}] ${message}`) : console.warn(`[${TAG}] ${message}`, error);
@@ -16,9 +20,35 @@ function restorePreviousFileOperations(preparation: { fileOps: { read: Set<strin
   if (Array.isArray(details.modifiedFiles)) for (const path of details.modifiedFiles) if (typeof path === "string") preparation.fileOps.edited.add(path);
 }
 
-function estimatedInputTokens(preparation: { messagesToSummarize: unknown[]; turnPrefixMessages: unknown[]; previousSummary?: string }): number {
-  // Deliberately conservative for code-heavy histories. This is a guard, not billing tokenization.
-  return Math.ceil(JSON.stringify([preparation.previousSummary ?? "", preparation.messagesToSummarize, preparation.turnPrefixMessages]).length / 2);
+/**
+ * Estimate the tokens the summarization prompt will actually carry, by measuring the artifact
+ * `compact()` actually sends.
+ *
+ * Upstream: pi itself. `compact()` -> `generateSummaryWithUsage` builds its prompt as
+ * `serializeConversation(convertToLlm(messagesToSummarize))`, and the split-turn arm adds a second
+ * call over `turnPrefixMessages` the same way (`dist/core/compaction/compaction.js:461-462,
+ * 584-588, 618-619`). Both functions are exported from the package, so this reuses pi's own code
+ * rather than reimplementing the primitive.
+ *
+ * This replaces a `JSON.stringify(<message objects>).length / 2` estimate that was measured
+ * 3.7x-37.9x too high across 14 real transcripts, and falsely refused 5 of them at a 272k window --
+ * on the exact tool-heavy sessions routing exists for. Two errors compounded there: chars/2 where
+ * pi's own conservative heuristic is chars/4 (`estimateTokens`,
+ * `dist/core/compaction/compaction.js:188-213`), and measuring the message *objects* -- every JSON
+ * key, quote, escaped newline, toolCallId and timestamp, plus tool results at full length -- when
+ * `serializeConversation` truncates every tool result to `TOOL_RESULT_MAX_CHARS = 2000`
+ * (`dist/core/compaction/utils.js:75, 128-133`). On a code-agent history, which is mostly large tool
+ * results, the two diverge without bound.
+ *
+ * Still an over-estimate, and deliberately so: this is a fit guard, not billing tokenization. The
+ * prompt scaffolding (the `<conversation>` wrapper, the summarization prompt, the system prompt) is
+ * a few hundred tokens and sits inside `reserveTokens`, which the caller adds on top.
+ */
+function estimatedInputTokens(preparation: Pick<Preparation, "messagesToSummarize" | "turnPrefixMessages" | "previousSummary">): number {
+  const serialized = (messages: SummarizedMessages): number => messages.length === 0 ? 0 : serializeConversation(convertToLlm(messages)).length;
+  // previousSummary rides along in the same prompt as a <previous-summary> block, so it counts.
+  const chars = serialized(preparation.messagesToSummarize) + serialized(preparation.turnPrefixMessages) + (preparation.previousSummary?.length ?? 0);
+  return Math.ceil(chars / 4);
 }
 
 /**
