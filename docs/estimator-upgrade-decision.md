@@ -29,12 +29,41 @@ the ledger has an `unobserved` outcome.
    string, and Accordion's npm predates the code W3 *did* steal from it (`recordPlanOutcome` is
    absent from `@a-fig/accordion@0.1.2` entirely).
 
-3. **The upgrade is optional, and its premise is already served.** Steal 8 is framed as an upgrade
-   *past* steal 1. W1 landed steal 1: the estimator now measures the artifact `compact()` actually
-   sends, via pi's own exported `serializeConversation`/`convertToLlm`, which closed the measured
-   3.7×–37.9× over-count that falsely refused 5 of 14 real sessions. The remaining error is a
-   deliberate over-estimate on a **fit guard**, not a billing path. A precise tokenizer would narrow
-   it; nothing currently observed requires that.
+3. **The upgrade is optional, and steal 1 already fixed the failure that motivated it.** Steal 8 is
+   framed as an upgrade *past* steal 1. W1 landed steal 1: the estimator now measures the artifact
+   `compact()` actually sends, via pi's own exported `serializeConversation`/`convertToLlm`, which
+   closed the measured 3.7×–37.9× over-count that falsely refused 5 of 14 real sessions. That
+   historical over-count is what steal 8 was offered against, and it is gone.
+
+   **The residual error does not point the way this file once claimed.** This reason used to end
+   "the remaining error is a deliberate over-estimate on a fit guard, not a billing path" — that
+   the estimate stayed conservative by design and a tokenizer would only narrow a margin already
+   pointing the safe way. The 2026-08-03 scale proof refuted the direction. On a 268 640-token
+   tool-heavy history against one Bedrock target, `estimatedInputTokens` returned **58 295 against
+   a provider-reported input of 69 323** — chars/4 UNDER-counts that provider's tokenization by
+   ~16%, an 11 028-token shortfall. Numbers and re-read artifacts:
+   `docs/runtime-evidence/2026-08-03-scale-proof.json` (`estimatorAccuracy`), re-asserted from those
+   bytes by `test/scale-proof-evidence.test.ts` on every `bun run check`. The operator-facing form of
+   the same correction is `README.md` §"Safety and limitations" ("it is not reliably an
+   over-estimate"), and the code comment is `src/index.ts`'s `estimatedInputTokens` header; all three
+   say the same thing on purpose, so a future reader cannot find one of them still claiming a
+   conservative estimate.
+
+   So the fit guard is sound by **dependency on `reserveTokens`**, not by any margin of its own: the
+   caller adds pi's default 16 384 on top, and 58 295 + 16 384 = 74 679 > 69 323. Raising the reserve
+   stays safe; lowering it toward this error, or overriding it per target, silently converts the
+   guard from sound to one that admits prompts which overflow. That live constraint is seed
+   **pi-lab-83ee** (open), which also carries the cheaper alternatives to vendoring — a labelled
+   safety multiplier on the estimate, or a floor on `reserveTokens` relative to it, or at minimum a
+   test that fails if the reserve's default drops.
+
+   **This changes the weight of the reasons, not the decision.** Reasons 1 and 2 are the ones that
+   decline the steal, and neither depends on the error's direction: the artifact at the named commit
+   is generated Rust, and the TypeScript route is an npm tarball. A precise tokenizer would now fix a
+   real gap rather than merely narrow a safe margin, so treat this reason as *no longer a positive
+   argument against vendoring* — it says only that the upgrade is optional and that nothing observed
+   forces it ahead of the cheaper options above. Anyone reopening the vendoring question should read
+   §"What a future vendoring owes" as the live acceptance shape, not this reason as a settled no.
 
 ## What was taken from steal 8 anyway
 
@@ -59,9 +88,13 @@ If the tokenizer is ever taken, stealList 2's A-vs-B methodology is the gate, an
 1. Named commit for whatever artifact is used, recorded in `NOTICE` with a per-file header.
 2. Report **overall and per-item** drift plus **p95 absolute** drift of the new estimate against the
    current one, over a corpus of real transcripts — not a single aggregate ratio.
-3. The decision metric: **how often the conservative estimate skips a target that would have fit.**
-   That is what the estimator exists to get right, and a tokenizer that improves mean accuracy while
-   changing no routing decision has bought nothing.
+3. The decision metric: **how often the current estimate skips a target that would have fit** — the
+   false-skip rate, which is what the estimator exists to get right, and a tokenizer that improves
+   mean accuracy while changing no routing decision has bought nothing. Since 2026-08-03 that metric
+   has a mirror image that must be reported with it: **how often estimate + `reserveTokens` admits a
+   target the provider then overflows.** The estimate under-counted by ~16% at scale (reason 3), so
+   false skips are no longer the only failure the guard can produce, and a corpus measured only for
+   them would miss the one the reserve is currently absorbing.
 4. The cap and the flag come with it, sized for the new cost. A real BPE pass is orders of magnitude
    more expensive than `length / 4`, so the cap stops being a formality — AFT measured 6.22 ms for 26
    fixtures, and a 268 k-token history is not 26 fixtures.
