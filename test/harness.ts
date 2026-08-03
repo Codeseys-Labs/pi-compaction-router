@@ -191,6 +191,40 @@ export interface HostOptions {
   cwd?: string;
   /** What the registry reports for `getAvailable()`, for the settings dialog's provider/model lists. */
   availableModels?: Array<{ id: string; provider: string; name?: string; contextWindow?: number; reasoning?: boolean }>;
+  /**
+   * The W5 observer's model call, injected. Omit it and the extension keeps its live implementation --
+   * which is exactly what the default-off test wants, because it proves the observer made no call
+   * without a stub standing in for the thing that would have made one.
+   */
+  workerCall?: (request: WorkerRequest) => Promise<string>;
+  /**
+   * What `ctx.sessionManager.getBranch()` returns: the session's entry list, which is where recorded
+   * facts live. Defaults to empty, which is what a session with no observations has.
+   */
+  branch?: unknown[];
+  /** `ctx.model`. Pass `null` to model a host with no active model. */
+  model?: unknown;
+  /** `ctx.signal`, for the abort paths. */
+  signal?: { aborted: boolean };
+}
+
+/** The request shape `src/observer.ts` hands its injected `WorkerCall`. Mirrored, not imported, so a
+ * test can assert on the fields without the harness depending on the module under test. */
+export interface WorkerRequest {
+  model: { provider: string; id: string; contextWindow?: number; maxTokens?: number };
+  systemPrompt: string;
+  prompt: string;
+  maxTokens: number;
+  thinkingLevel?: string;
+  auth: { apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> };
+  signal?: unknown;
+}
+
+/** What a registered tool's `execute` returns, as the harness surfaces it. */
+export interface ToolOutcome {
+  content: Array<{ type: string; text?: string }>;
+  details?: unknown;
+  isError?: boolean;
 }
 
 export interface Host {
@@ -202,6 +236,17 @@ export interface Host {
   commandNames(): string[];
   /** Drive a registered slash command against the same ctx the handlers get. */
   runCommand(name: string, args?: string): Promise<unknown>;
+  /**
+   * Every tool the extension registered via `pi.registerTool`.
+   *
+   * The harness used to offer a no-op `addTool`, which is not a method pi's `ExtensionAPI` has at all
+   * (`registerTool` is, `loader.js:195`). A no-op under the wrong name meant a real
+   * `pi.registerTool` call crashed every handler test with `is not a function` -- so the stub was
+   * worse than nothing, and the correct name is modelled here rather than absorbed.
+   */
+  toolNames(): string[];
+  /** Drive a registered tool against the same ctx the handlers get. */
+  runTool(name: string, params: unknown): Promise<ToolOutcome>;
   readonly ui: FakeInteractiveUI;
   readonly ctx: Record<string, unknown>;
   /**
@@ -234,24 +279,41 @@ export async function withHost<T>(
     const mod = await loader();
     const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    type ToolSpec = { name: string; execute: (id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) => Promise<ToolOutcome> };
+    const tools = new Map<string, ToolSpec>();
     /** Every `pi.appendEntry` call, so a test can prove the session mirror was written. */
     const entries: Array<{ customType: string; data: unknown }> = [];
-    (mod.default as (pi: unknown) => void)({
-      on: (name: string, fn: (event: unknown, ctx: unknown) => unknown) => handlers.set(name, fn),
-      registerCommand: (name: string, spec: { handler: (args: string, ctx: unknown) => unknown }) => commands.set(name, spec.handler),
-      addCommand: () => {},
-      addTool: () => {},
-      sendMessage: () => {},
-      appendEntry: (customType: string, data: unknown) => { entries.push({ customType, data }); },
-    });
+    (mod.default as (pi: unknown, extra?: unknown) => void)(
+      {
+        on: (name: string, fn: (event: unknown, ctx: unknown) => unknown) => handlers.set(name, fn),
+        registerCommand: (name: string, spec: { handler: (args: string, ctx: unknown) => unknown }) => commands.set(name, spec.handler),
+        // Pi's real name for this, and the one `src/index.ts` calls. See `Host.toolNames`.
+        registerTool: (spec: ToolSpec) => tools.set(spec.name, spec),
+        addCommand: () => {},
+        sendMessage: () => {},
+        appendEntry: (customType: string, data: unknown) => { entries.push({ customType, data }); },
+      },
+      // The W5 seam: an injected worker call, so the observer never reaches a network and a test can
+      // count invocations. Absent unless a test supplies one, which is what lets the default-off test
+      // assert that the extension made no call rather than that a stub was never configured.
+      options.workerCall ? { workerCall: options.workerCall } : undefined,
+    );
 
     const ui = new FakeInteractiveUI();
     const available = options.availableModels ?? [];
     const ctx: Record<string, unknown> = {
       cwd: options.cwd ?? projectDir(),
-      sessionManager: { getSessionId: () => options.sessionId ?? "test-session", getSessionFile: () => null },
+      sessionManager: {
+        getSessionId: () => options.sessionId ?? "test-session",
+        getSessionFile: () => null,
+        // The entry list the preservation layer folds over. Empty by default: a session that has
+        // recorded nothing is the state every pre-W5 test is implicitly in.
+        getBranch: () => options.branch ?? [],
+      },
       isProjectTrusted: () => options.projectTrusted ?? false,
-      model: { provider: "anthropic", id: "claude-sonnet-4-5", contextWindow: 200_000 },
+      isIdle: () => true,
+      signal: options.signal,
+      model: options.model === undefined ? { provider: "anthropic", id: "claude-sonnet-4-5", contextWindow: 200_000 } : options.model ?? undefined,
       // `mode` defaults to "tui" so the interactive surface is reachable. `hasUI` is true for both "tui"
       // and "rpc" (pi's own rule), which is exactly why the config command gates on `mode`.
       mode: options.mode ?? "tui",
@@ -283,6 +345,12 @@ export async function withHost<T>(
         const handler = commands.get(name);
         if (!handler) throw new Error(`no command registered as '${name}'`);
         return await handler(args, ctx);
+      },
+      toolNames: () => [...tools.keys()],
+      runTool: async (name, params) => {
+        const tool = tools.get(name);
+        if (!tool) throw new Error(`no tool registered as '${name}'`);
+        return await tool.execute("test-tool-call", params, undefined, undefined, ctx);
       },
       ui,
       ctx,
