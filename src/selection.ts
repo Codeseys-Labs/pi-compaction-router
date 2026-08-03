@@ -113,8 +113,9 @@ export function selectTargets(config: RouterConfig, activeModel: string, reason:
 /**
  * The effective context window for a target: the operator's override, else the registry's number.
  *
- * Upstream: pi-blackhole `src/om/model-budget.ts:15-41` (`effectiveContextWindow`), read at commit
- * 2bf8cda11585c21fef2e5c2d9210690d82a2f2ca. MIT, Copyright (c) 2026 the pi-blackhole authors.
+ * Upstream: https://github.com/k0valik/pi-blackhole, `src/om/model-budget.ts:15-41`
+ * (`effectiveContextWindow`), read at commit 2bf8cda11585c21fef2e5c2d9210690d82a2f2ca.
+ * MIT, Copyright (c) 2026 k0valik.
  * Upstream's resolution ORDER is the mechanism taken: a per-model config override wins, then the
  * registry value. Upstream's third step -- a hardcoded 128 000 fallback -- is deliberately NOT taken:
  * a registry entry reporting no window is precisely the case where a made-up number would let this

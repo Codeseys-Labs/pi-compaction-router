@@ -1,13 +1,13 @@
 /**
  * Persisted per-target cooldowns: stop re-trying a flapping provider on every compaction.
  *
- * Upstream: https://github.com/JMHSV/pi-blackhole, `src/om/cooldown.ts` (the whole module: the
+ * Upstream: https://github.com/k0valik/pi-blackhole, `src/om/cooldown.ts` (the whole module: the
  * `{until, reason, stage}` entry shape, `cooldownPath`, `readCooldownMap`/`writeCooldownMap`,
  * `getCooldownEntry` with lazy expiry-on-read, `recordCooldown`, `expireCooldowns`, and the
  * `cooldownHours === 0` early returns) plus the in-memory `failedInCycle` half of
  * `src/om/runtime.ts` (`resolveModel`'s skip arm and `recordRetryableError`'s `cooldownHours === 0`
- * branch). Read at commit 2bf8cda11585c21fef2e5c2d9210690d82a2f2ca. MIT, Copyright (c) 2026 the
- * pi-blackhole authors.
+ * branch). Read at commit 2bf8cda11585c21fef2e5c2d9210690d82a2f2ca. MIT, Copyright (c) 2026
+ * k0valik.
  *
  * WHY this exists here. This package had no memory of failure at all: a rate-limited target was
  * retried on every single compaction, forever. W2's per-target retry (`src/retry.ts`) makes that
