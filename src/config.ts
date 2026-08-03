@@ -16,6 +16,25 @@ export interface ModelTarget {
    * into a disk write. See `src/cooldown.ts`.
    */
   cooldownHours?: number;
+  /**
+   * Correct a wrong registry context window for this target, instead of letting the fit guard skip it
+   * on bad metadata.
+   *
+   * Upstream: pi-blackhole `om/model-budget.ts:15-41` (`effectiveContextWindow`) and its
+   * `OmModelConfig.contextWindow` field (`core/unified-config.ts:62-63`, "Context window override for
+   * this model. Inherits from Pi's model registry when unset"), read at commit
+   * 2bf8cda11585c21fef2e5c2d9210690d82a2f2ca. MIT. Upstream's resolution order -- config override, then
+   * the registry value, then a default -- is taken; upstream's 128 000 fallback is NOT, because our
+   * `Model` always carries a `contextWindow` and inventing one for a target that reports none would be
+   * a guess where the whole point is a measurement. See `effectiveContextWindow` in
+   * `src/selection.ts`.
+   *
+   * WHY it earns a config surface here (dive-pi-blackhole.md steal 7): the fit guard SKIPS a target
+   * whose window cannot hold the prompt. When a registry entry understates a window -- a proxy provider,
+   * a stale catalogue, a self-hosted endpoint -- the operator's correct configuration is silently
+   * unroutable and the only remedy is to stop using the target. This is the escape hatch.
+   */
+  contextWindow?: number;
 }
 export interface Route { match: string; models: ModelTarget[]; reasons: CompactionReason[] }
 export interface ResumeConfig { reasons: CompactionReason[]; message: string }
@@ -53,6 +72,21 @@ function hours(v: unknown, label: string, warn: (s: string) => void): number | u
   return v;
 }
 
+/**
+ * A STRICTLY positive token count, or `undefined` when absent or unusable.
+ *
+ * Separate from `hours` above and not a parameterisation of it, because the two disagree about zero on
+ * purpose: `cooldownHours: 0` is a meaningful setting, whereas `contextWindow: 0` is pi's own encoding
+ * for "no window known" and is exactly the bad metadata this override exists to correct. Upstream
+ * agrees -- blackhole's `effectiveContextWindow` gates on `> 0` and its parser uses `positiveInt`
+ * (`core/unified-config.ts:275`).
+ */
+function positiveTokens(v: unknown, label: string, warn: (s: string) => void): number | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) { warn(`Ignoring invalid ${label} '${String(v)}'; it must be a positive number of tokens.`); return undefined; }
+  return Math.floor(v);
+}
+
 function target(v: unknown, warn: (s: string) => void): ModelTarget | null {
   if (!record(v) || typeof v.model !== "string" || !v.model.trim()) { warn("Ignoring model target without provider/model."); return null; }
   let thinkingLevel: ThinkingLevel | undefined;
@@ -60,7 +94,12 @@ function target(v: unknown, warn: (s: string) => void): ModelTarget | null {
     if (typeof v.thinkingLevel === "string" && (THINKING_LEVELS as readonly string[]).includes(v.thinkingLevel)) thinkingLevel = v.thinkingLevel as ThinkingLevel;
     else warn(`Ignoring invalid thinking level '${String(v.thinkingLevel)}'.`);
   }
-  return { model: v.model.trim(), thinkingLevel, cooldownHours: hours(v.cooldownHours, "cooldownHours", warn) };
+  return {
+    model: v.model.trim(),
+    thinkingLevel,
+    cooldownHours: hours(v.cooldownHours, "cooldownHours", warn),
+    contextWindow: positiveTokens(v.contextWindow, "contextWindow", warn),
+  };
 }
 function targets(v: unknown, warn: (s: string) => void): ModelTarget[] {
   if (!Array.isArray(v)) return [];

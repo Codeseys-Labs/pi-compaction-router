@@ -30,9 +30,15 @@ const FOUND_MODEL = { provider: "openai-codex", id: "gpt-5.4-mini", contextWindo
 const GOOD_AUTH = { ok: true, apiKey: "test-key", headers: {}, env: {} };
 
 /**
- * Every registry method the router touches, counted. `find` and `getApiKeyAndHeaders` are the two
- * doors to a provider that an extension has; a probe would have to go through one of them (or through
- * `compact()`, counted separately by the caller).
+ * Every registry method the router touches, counted.
+ *
+ * `getApiKeyAndHeaders` and `compact()` are the PAID doors -- one resolves a credential, the other
+ * spends tokens -- and a probe has to go through one of them to cost anything. `find` is counted
+ * alongside them but is not one: it is a synchronous read of the in-memory catalogue
+ * (`ModelRegistry.find` -> `ModelRuntime.getModel` -> `Models.getModel`, `pi-ai/dist/models.js:69-71`),
+ * with no network and no credential. It is still counted, because an unbounded number of catalogue
+ * reads would be a bug of a different kind, and because a future implementation that reached a provider
+ * through it should have to change a number here to do so.
  */
 interface Counts { find: number; auth: number; compact: number }
 
@@ -146,13 +152,43 @@ describe("provider health is passive: no probe is ever made", () => {
   });
 
   test("a routed compaction makes exactly the calls the route needed, and not one more", async () => {
-    // The first target is found, authenticated and serves it. One find, one auth, one compact. Any
-    // extra call on any counter is a probe: the route needed none of them.
+    // One PAID call of each kind: one auth, one compact. The winning target is authenticated once and
+    // asked for one summary; any extra on either counter is a probe, because the route needed none.
+    //
+    // `find` is 2 -- one per configured target -- and that is the fit-aware selector (G6), not a probe.
+    // Cheapest-that-fits cannot order a chain without reading each candidate's window and price, so it
+    // resolves every target up front instead of lazily per hop. This test is what forces that
+    // distinction to be argued rather than assumed, so the argument is recorded here: `find` reaches no
+    // provider at all. `ModelRegistry.find` -> `ModelRuntime.getModel` -> `Models.getModel`, which is
+    // `getModels(provider).find(m => m.id === id)` over the in-memory catalogue
+    // (`pi-ai/dist/models.js:69-71`) -- synchronous, no network, no credential, nothing billable. The
+    // paid doors are `getApiKeyAndHeaders` and `compact()`, and those are the two held at 1 here.
+    //
+    // So the passivity rule is intact under its own terms ("never probe providers on their own"), and
+    // the bound that matters is asserted exactly: the second target is never authenticated and never
+    // asked to compact, even though it was ranked.
     const counts = await countRegistryCalls(async host => {
       await host.emit("session_before_compact", beforeCompactEvent());
       await host.emit("session_compact", compactEvent({ fromExtension: true }));
     });
-    expect(counts).toEqual({ find: 1, auth: 1, compact: 1 });
+    expect(counts).toEqual({ find: 2, auth: 1, compact: 1 });
+  });
+
+  test("catalogue reads are bounded at one per configured target, however long the chain", async () => {
+    // The companion bound to the test above, and the one that keeps "resolve up front" from drifting
+    // into "resolve repeatedly". A four-target chain costs four catalogue reads for the whole
+    // compaction -- not four per hop, and not one per hop on top of the ranking pass.
+    const counts = await countRegistryCalls(
+      async host => {
+        await host.emit("session_before_compact", beforeCompactEvent());
+        await host.emit("session_compact", compactEvent({ fromExtension: true }));
+      },
+      { routerConfig: { models: [{ model: "a/one" }, { model: "b/two" }, { model: "c/three" }, { model: "d/four" }] } },
+    );
+    expect(counts.find).toBe(4);
+    // And still exactly one paid call of each kind: the first fitting target served it.
+    expect(counts.auth).toBe(1);
+    expect(counts.compact).toBe(1);
   });
 
   test("recording a failure adds no call of its own", async () => {
@@ -170,15 +206,19 @@ describe("provider health is passive: no probe is ever made", () => {
   });
 
   test("a second compaction re-discovers rather than pre-checking", async () => {
-    // Two compactions cost exactly twice one compaction. A health record that pre-validated targets
-    // at the start of the second compaction would show up here as extra auth calls.
+    // Two compactions cost exactly twice one compaction: nothing is cached across them, and nothing is
+    // warmed ahead of them. A health record that pre-validated targets at the start of the second
+    // compaction would show up here as extra auth calls -- the paid counter, which stays at one per
+    // compaction. `find` doubles with the compactions for the same reason it is 2 above (one catalogue
+    // read per configured target per compaction, unbilled), and doubling rather than growing is the
+    // point: the second compaction re-reads, it does not accumulate.
     const counts = await countRegistryCalls(async host => {
       for (let i = 0; i < 2; i++) {
         await host.emit("session_before_compact", beforeCompactEvent());
         await host.emit("session_compact", compactEvent({ fromExtension: true }));
       }
     });
-    expect(counts).toEqual({ find: 2, auth: 2, compact: 2 });
+    expect(counts).toEqual({ find: 4, auth: 2, compact: 2 });
   });
 
   test("the health module itself exposes no way to reach a provider", () => {

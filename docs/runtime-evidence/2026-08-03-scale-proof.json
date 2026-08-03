@@ -1,0 +1,112 @@
+{
+  "proof": "pi-compaction-router G9 scale re-proof",
+  "generatedAt": "2026-08-03T07:37:46.309Z",
+  "verdict": "PASS",
+  "scale": {
+    "tokensBefore": 268640,
+    "honestEstimate": 58295,
+    "legacyEstimate": 564280,
+    "legacyOverCountRatio": 9.68,
+    "reserveTokens": 16384,
+    "v1ProofTokensBefore": 481,
+    "legacyWouldRefuseAt272k": true,
+    "honestFitsAt272k": true
+  },
+  "selection": {
+    "mechanism": "rankByFit (G6): cheapest input price among targets whose window holds the prompt",
+    "candidatesConsidered": 109,
+    "fittingCandidates": 107,
+    "cheapestFittingCandidate": "amazon-bedrock/amazon.nova-micro-v1:0",
+    "servedBy": "amazon-bedrock/google.gemma-3-4b-it",
+    "servedByWindow": 128000,
+    "servedByInputCostPerMTok": 0.04,
+    "cheapestRejectedForFit": "amazon-bedrock/mistral.voxtral-small-24b-2507",
+    "attempts": [
+      {
+        "target": "amazon-bedrock/amazon.nova-micro-v1:0",
+        "inputCostPerMTok": 0.035,
+        "outcome": "call-failed",
+        "error": "Summarization failed: Validation error: 400: {\"_events\":{\"close\":[null],\"error\":[null,null],\"frameError\":[null],\"aborted\":[null],\"response\":[null]},\"_readableState\":{\"highWaterMark\":65536,\"buffer\":[],\"bufferIndex\":0,\"length\":0,\"pipes\":[],\"awaitDrainWriters\":null},\"_writableState\":{\"highWaterMark\":65"
+      },
+      {
+        "target": "amazon-bedrock/google.gemma-3-4b-it",
+        "inputCostPerMTok": 0.04,
+        "outcome": "served"
+      }
+    ],
+    "hopsBeforeSuccess": 1
+  },
+  "catalogueCaveat": {
+    "finding": "ModelRegistry.getAvailable() lists models that cannot actually be invoked, so the cheapest fitting candidate is not necessarily the one that serves",
+    "measuredOn": "2026-08-03T07:37:46.309Z",
+    "totalListed": 109,
+    "failedBeforeSuccess": [
+      {
+        "target": "amazon-bedrock/amazon.nova-micro-v1:0",
+        "outcome": "call-failed"
+      }
+    ],
+    "isolatedCause": "on-demand throughput unsupported; the global./us.-prefixed inference-profile ids are the invocable form",
+    "errorNormalisationCaveat": "pi's Bedrock error path can substitute a serialised socket object for the provider's message on a large request, so the cause is unreadable from the error alone"
+  },
+  "estimatorAccuracy": {
+    "honestEstimate": 58295,
+    "providerReportedInput": 69323,
+    "estimateOverProviderRatio": 0.841,
+    "estimatePlusReserve": 74679,
+    "guardHoldsWithReserve": true,
+    "note": "chars/4 under-counted this provider's tokenization; reserveTokens is what keeps the fit guard sound, not the estimate's own margin"
+  },
+  "persistedEntry": {
+    "sessionFile": "/tmp/w12-w6/proof-final2/sessions/2026-08-03T07-37-46-311Z_019fc68e-aa47-751f-9d86-37975d98a3d4.jsonl",
+    "entryId": "2908248b",
+    "fromHook": true,
+    "summaryChars": 2849,
+    "tokensBefore": 268640,
+    "usage": {
+      "input": 69323,
+      "output": 922,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "totalTokens": 70245,
+      "cost": {
+        "input": 0.00277292,
+        "output": 0.00007376,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "total": 0.00284668
+      }
+    },
+    "reReadFromDisk": true
+  },
+  "ledger": {
+    "path": "/tmp/w12-w6/proof-final2/compaction-router/ledger.jsonl",
+    "routedRows": 1,
+    "servedBy": {
+      "model": "amazon-bedrock/google.gemma-3-4b-it",
+      "active": false
+    },
+    "windowRecorded": 128000
+  },
+  "provenance": {
+    "agentDir": "/tmp/w12-w6/proof-final2",
+    "isScratchDir": true,
+    "liveProfileUntouched": "/home/codeseys/.pi/agent",
+    "startedAt": "2026-08-03T07:37:37.828Z",
+    "finishedAt": "2026-08-03T07:37:46.309Z",
+    "piCodingAgentVersion": "0.81.1"
+  },
+  "notClaimed": [
+    "automatic threshold or overflow compaction (this drives the manual path)",
+    "ordered fallback after a real provider failure",
+    "subagent compaction, which is out of scope for this package (docs/subagent-compaction-disposition.md)",
+    "anything about the operator's live ~/.pi profile, which this run never reads or writes"
+  ],
+  "artifacts": {
+    "note": "Copied out of the scratch agent dir and committed, because the v1 proof's evidence lived in /tmp and evaporated (dive-ours §3, verdict §4.3). These are the bytes the assertions above were made against.",
+    "sessionFile": "/home/codeseys/DevBox/custom-pi-setup/pi-compaction-router/.worktrees/w6/docs/runtime-evidence/2026-08-03-scale-proof-artifacts/session.jsonl",
+    "ledgerFile": "/home/codeseys/DevBox/custom-pi-setup/pi-compaction-router/.worktrees/w6/docs/runtime-evidence/2026-08-03-scale-proof-artifacts/ledger.jsonl",
+    "originalScratchSessionFile": "/tmp/w12-w6/proof-final2/sessions/2026-08-03T07-37-46-311Z_019fc68e-aa47-751f-9d86-37975d98a3d4.jsonl",
+    "originalScratchLedgerFile": "/tmp/w12-w6/proof-final2/compaction-router/ledger.jsonl"
+  }
+}
