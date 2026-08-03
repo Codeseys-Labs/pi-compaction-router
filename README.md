@@ -53,8 +53,11 @@ Add `compactionRouter` to global `~/.pi/agent/settings.json` or trusted project 
 
 - The first matching route wins. There is no specificity ordering, so a general pattern placed before a specific one makes the specific route dead configuration — `anthropic/*` before `anthropic/claude-opus-*` means the second route is never used. The extension warns about this once per configuration and `/compaction-router` shows it.
 - `models` at the router root is the fallback route.
-- Each model is tried in order. If all fail, the extension returns control to Pi's native active-model handler.
+- **Among the targets a route allows, the cheapest one that can actually hold this compaction's prompt is tried first.** Ordering is by catalogued input price (`$/Mtok`), because a summarization call is dominated by its input — Pi sends the whole conversation and asks for at most `0.8 × reserveTokens` back. Three rules keep that from being a false economy: a target that cannot hold the prompt is ranked *behind* every one that can rather than being treated as cheap; a model the catalogue reports no price for sorts **last** among those that fit, never first, because a missing price is not a price of zero; and equal prices preserve the order you wrote, since your sequencing is information. Nothing is ever dropped — the ranking changes the order, never the set.
+- Output price is deliberately **not** blended into that ordering. Any weighting between input and output cost would be a constant nobody has measured, so none is invented.
+- Each remaining model is tried in order. If all fail, the extension returns control to Pi's native active-model handler.
 - Missing models, missing authentication, and models too small to hold the summarization prompt are skipped. The fit check measures the artifact Pi actually sends — `serializeConversation(convertToLlm(...))`, in which every tool result is truncated to 2 000 characters — not the raw message objects.
+- `contextWindow` on a target **overrides** what Pi's registry reports for it. It exists for the case where the registry understates a window — a proxy provider, a stale catalogue, a self-hosted endpoint — which would otherwise make correct configuration silently unroutable with no remedy but to stop using the target. It is the number the fit decision and the ledger both use. Unlike `cooldownHours`, `0` is *not* meaningful here and is ignored with a warning: Pi uses zero to mean "no window known", which is the metadata this corrects. A target with no window from either source does not fit, because inventing one would let this package route a prompt it has no evidence fits.
 - A target whose output cap cannot hold the summary Pi is about to ask for is warned about, and skipped when the shortfall is severe. Pi asks for `0.8 × reserveTokens` output tokens and silently caps that at the model's own `maxTokens`, so with a raised `reserveTokens` a small-output model truncates its summary with nothing said anywhere.
 - `overflow` never receives an extra resume turn because Pi already retries the interrupted request.
 
@@ -182,7 +185,50 @@ reaches the model registry.
 The record is currently an input for future target deprioritisation, not a decision: nothing here
 reorders a route chain today.
 
-## Executed manual-compaction proof (2026-07-28)
+## Executed scale proof (2026-08-03) — supersedes the 481-token proof below
+
+**MEASURED at 268 640 tokens, with the evidence in this repository.** `scripts/scale-proof.ts` drove a
+real `compact()` against a real, authenticated Bedrock target on a tool-heavy history calibrated to the
+268 697-token session that this package's old estimator falsely refused at a 272 000-token window. The
+compaction entry was persisted by Pi's own `appendCompaction`, then **re-read from disk** and asserted:
+non-empty summary, `fromHook: true`, `tokensBefore: 268640`.
+
+Evidence, tracked rather than described: `docs/runtime-evidence/2026-08-03-scale-proof.json`, with the
+session file and ledger row it was made against copied beside it under
+`docs/runtime-evidence/2026-08-03-scale-proof-artifacts/`. `test/scale-proof-evidence.test.ts` re-derives
+the claims from those bytes on every `bun run check`, so the record cannot quietly rot or be weakened.
+
+What is new about this proof, beyond the scale:
+
+- **Which target served it is a FIELD, not an inference.** The 2026-07-28 proof had to assign a
+  CloudTrail request to a session entry by matching timestamps and usage, and said so ("INFERRED, high
+  confidence"). The W3 ledger records `servedBy` directly.
+- **The estimator was checked against the provider's own count, and the result corrects this README.**
+  The honest estimate was 58 295 tokens against a provider-reported input of 69 323 — so characters ÷ 4
+  **under-counts** this provider's tokenization by ~16%, rather than over-estimating as the fit guard's
+  comment assumed. The guard is still sound, and the arithmetic showing why is recorded: `reserveTokens`
+  (16 384) is what carries the margin, not the estimate. A future change that shrinks the reserve toward
+  the estimate's error would make the guard admit prompts that overflow.
+- **`getAvailable()` is auth-filtered, not invocation-filtered.** The cheapest fitting candidate in the
+  catalogue failed the call, and the chain advanced past it to serve the compaction. Several listed
+  Bedrock ids refuse with `Invocation of model ID <id> with on-demand throughput isn't supported` and are
+  reachable only through their `global.`/`us.`-prefixed inference-profile entries. So "cheapest that
+  fits" is cheapest among *listed* models; invocability is discovered by calling, and every hop is
+  recorded in the evidence rather than hidden behind a hand-picked winner.
+- **A second Pi-side observation, recorded because it costs an operator diagnosability:** at this scale
+  Pi's Bedrock error path substituted a serialised socket object for the provider's message, so the same
+  failure that reads clearly on a small prompt is unreadable on a large one.
+
+Still **not** established: automatic `threshold` or `overflow` compaction, ordered fallback after a
+*provider* failure of a target that would otherwise work, and subagent compaction — which is out of
+scope for this package by written disposition (`docs/subagent-compaction-disposition.md`). The run never
+reads or writes `~/.pi`: it refuses to start unless `PI_CODING_AGENT_DIR` names a scratch directory.
+
+```sh
+PI_CODING_AGENT_DIR=/tmp/scratch-agent-dir bun run scripts/scale-proof.ts
+```
+
+## Executed manual-compaction proof (2026-07-28) — superseded, kept for provenance
 
 **MEASURED — function, not merely registration.** A disposable live session used a session-local
 route from active `amazon-bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0` to
@@ -224,11 +270,25 @@ compaction assertion as a broken probe, not evidence about the router.
 
 ## Safety and limitations
 
-- Install only one `session_before_compact` owner.
+- **Install only one `session_before_compact` owner. Co-installing another is UNSUPPORTED, and Pi cannot
+  arbitrate it.** Pi's dispatcher runs every registered handler for the event, keeps the last truthy
+  result, and short-circuits the whole loop on `{cancel: true}` — so two owners are mutually destructive
+  and which one wins is load order, not configuration. Specifically unsupported alongside this package:
+  `pi-magic-context` (cancels compaction unconditionally), `pi-blackhole` and
+  `pi-observational-memory` (each returns its own summary; last writer by manifest order wins), and
+  `accordion` (cancels while its GUI is attached). This package detects the loss after the fact rather
+  than pretending it can prevent it: when Pi reports an extension produced the summary on a compaction
+  this package resolved without producing one, a hook-collision widget says so. Pi records only *that*
+  an extension produced a summary, never which, so the report names the candidates and does not accuse
+  one. `test/collision.test.ts` asserts the reviewed profile registers exactly one owner.
+- **Subagent compactions are not routed at all**, and for dynamic/fractal workflow subagents they cannot
+  be — those sessions load with no extension runtime. They still compact, on their own model, and this
+  package's ledger cannot see them, so the savings meter reads parent-session compactions only. Written
+  disposition, with the measurements: `docs/subagent-compaction-disposition.md`.
 - Routed models use credentials already registered with Pi.
 - The package performs no direct network or subprocess operations; model calls go through Pi's model registry and native compaction function. Its only write is the append-only ledger under `$PI_CODING_AGENT_DIR/compaction-router/`, and a failed ledger write is swallowed after one warning rather than failing the compaction.
 - The ledger records the summary's *size*, never its text, and no message content. It does record the project path and the configured target names.
-- The context-fit estimate still rounds up (characters ÷ 4, the same heuristic Pi uses) and is not exact provider tokenization. It is a fit guard, not billing.
+- The context-fit estimate is characters ÷ 4 over the artifact Pi sends, the same heuristic Pi uses, and it is not exact provider tokenization — it is a fit guard, not billing. **Measured 2026-08-03, correcting an earlier assumption here: it is not reliably an over-estimate.** Against one Bedrock target at 268 640 tokens it came in ~16% *under* the provider's reported input (58 295 estimated, 69 323 reported). The guard holds because `reserveTokens` is added on top and carries the margin, not because the estimate is conservative. Lowering `reserveTokens` toward that error would make the guard admit prompts that overflow.
 - Model fallback after a failed provider call can incur partial provider cost.
 - Routed compactions are passed the host's own `settings.retry` policy, so a transient stream drop is retried before the route advances — the same policy Pi's native compaction runs with.
 - If every configured target is skipped or throws, the hook returns control to Pi's native active-model handler: this is **fail-open**, not fail-closed. That outcome is reported to the operator as a widget above the editor, raised after the compaction commits and retracted by the next one. It is not a `notify`: Pi clears and rebuilds the chat container on `compaction_end`, which destroys anything the before-hook put there. The same widget reports the two cases where no target was even attempted — every target cooling down, or no route covering this compaction reason — because those are indistinguishable from a working compaction otherwise.
