@@ -1,14 +1,18 @@
 import { compact, convertToLlm, getAgentDir, getSettingsListTheme, getSelectListTheme, serializeConversation, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionCompactEvent } from "@earendil-works/pi-coding-agent";
+import { Type } from "@earendil-works/pi-ai";
 import type { SettingItem } from "@earendil-works/pi-tui";
 import { advancesChain, chainExhausted, chainHalt, type ChainStop } from "./chain.js";
 import { configToSettingsValue, cooldownHoursFor, loadConfig, loadRetryPolicy, parseModelReference, parseSessionOverride, REASONS, type CompactionReason, type ModelTarget, type RouterConfig } from "./config.js";
 import { CooldownStore } from "./cooldown.js";
 import { ACTIVE_MODEL_TARGET, appendRow, clearRouteRecord, estimateSummaryTokens, formatSavingsRows, readSavings, setRouteRecord, takeRouteRecord, type LedgerRow, type RouteRecord, type ServingTarget } from "./ledger.js";
 import { validateReference, type PickableRegistry } from "./model-picker.js";
+import { runObserver, type WorkerCall } from "./observer.js";
 import { clearPendingWarning, setPendingWarning, takePendingWarning } from "./pending-warning.js";
+import { buildCompactionCustomInstructions } from "./preservation-prompt.js";
+import { FACTS_RECORDED, formatRecallResult, readFacts, recallFact, renderFold, resolveObserveAfterTokens, tokensSinceCoverage, type FactsRecorded, type LedgerEntry } from "./preservation.js";
 import { formatHealthRows, ProviderHealth } from "./provider-health.js";
 import { classifyFailure, withTargetRetry, type Classification } from "./retry.js";
-import { checkMaxTokens, findRouteShadowing, selectTargets, type Suppressor } from "./selection.js";
+import { checkMaxTokens, findRouteShadowing, selectTargets, selectWorkerTargets, type Suppressor } from "./selection.js";
 import { ADVANCED_ROW, RESUME_ROW, RESUME_VALUES, RouterDraft } from "./settings-draft.js";
 import { readSnapshot, SETTINGS_KEY, SettingsWriteError, writeSection, type SettingsScope } from "./settings-store.js";
 import { buildSettingsDialog, ProviderModelPicker } from "./settings-ui.js";
@@ -184,9 +188,118 @@ function recordCooldown(store: CooldownStore, config: RouterConfig, target: Mode
   });
 }
 
-export default function compactionRouter(pi: ExtensionAPI): void {
+/**
+ * The preservation layer's rows for `/compaction-router`.
+ *
+ * "off" is stated rather than omitted: the layer is off by default, and an operator who expected a fold
+ * needs to read the state instead of inferring it from an absent block. When it is on, the row names
+ * the worker chain, the resolved threshold (with the ratio arithmetic shown, since a ratio threshold is
+ * a derived number nobody can check by eye) and how many facts the branch currently carries.
+ */
+function preservationStatusRows(config: RouterConfig, ctx: Pick<ExtensionContext, "model" | "sessionManager">): string[] {
+  const preservation = config.preservation;
+  if (!preservation.enabled) return ["Preservation: off (set compactionRouter.preservation.enabled to true to record facts)"];
+  const active = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown/unknown";
+  const workers = selectWorkerTargets(config, active);
+  const threshold = resolveObserveAfterTokens(preservation, ctx.model?.contextWindow);
+  const rows = [
+    "",
+    "Preservation:",
+    `  Worker              ${workers.fire.length ? workers.fire.map(t => `${t.model}${t.thinkingLevel ? `:${t.thinkingLevel}` : ""}`).join(" -> ") : `none (${workers.suppressor})`}`,
+    `  Observe after       ${threshold.toLocaleString("en-US")} tokens${preservation.mode === "ratio" ? ` (${preservation.ratio} x the active window)` : ""}`,
+    `  Fold into prompt    ${preservation.injectFold ? "yes" : "no"}`,
+  ];
+  try {
+    const { facts } = readFacts(ctx.sessionManager.getBranch() as unknown as LedgerEntry[]);
+    rows.push(`  Facts recorded      ${facts.length}${facts.length > preservation.maxFacts ? ` (${facts.length - preservation.maxFacts} dropped from the fold by coverage rank)` : ""}`);
+  } catch {
+    // A status surface must not be the thing that throws. Omit the count rather than fail the command.
+  }
+  return rows;
+}
+
+/**
+ * The one model call the preservation layer makes, isolated behind a dynamic import.
+ *
+ * `completeSimple` from `@earendil-works/pi-ai/compat` is the same primitive pi's own summarization
+ * choke point reaches (`completeSummarization` -> `completeSimple`,
+ * `dist/core/compaction/compaction.js:415-418`), so a routed observer call goes down the same
+ * transport as a routed compaction. It is imported lazily and only from inside this function, which is
+ * what keeps the OFF path free of it: with the default config this module is never loaded, so the
+ * "no worker call" test asserts a fact about the module graph and not merely about a counter.
+ *
+ * Errors are left to throw. `runObserver` classifies them through `classifyFailure` (algal PR #7's
+ * taxonomy) and the caller cools the target down if it earned it.
+ */
+const liveWorkerCall: WorkerCall = async request => {
+  const { completeSimple } = await import("@earendil-works/pi-ai/compat");
+  const options: Record<string, unknown> = {
+    maxTokens: request.maxTokens,
+    apiKey: request.auth.apiKey,
+    headers: request.auth.headers,
+    env: request.auth.env,
+    signal: request.signal,
+  };
+  // Pi's own rule for a reasoning model (`createSummarizationOptions`, `compaction.js:427-433`): send
+  // `reasoning` only when the model supports it AND the level is not "off".
+  if (request.thinkingLevel && request.thinkingLevel !== "off") options.reasoning = request.thinkingLevel;
+  const response = await completeSimple(
+    request.model as Parameters<typeof completeSimple>[0],
+    { systemPrompt: request.systemPrompt, messages: [{ role: "user", content: [{ type: "text", text: request.prompt }], timestamp: Date.now() }] },
+    options as Parameters<typeof completeSimple>[2],
+  );
+  if (response.stopReason === "error") throw new Error(`Observer call failed: ${response.errorMessage || "unknown error"}`);
+  return (response.content ?? [])
+    .filter((block): block is { type: "text"; text: string } => (block as { type?: string }).type === "text")
+    .map(block => block.text)
+    .join("\n");
+};
+
+/**
+ * Run background work after the current event has returned — POM stealList 7's `setTimeout(0)` half.
+ *
+ * Upstream defers its proactive compaction this way (`hooks/compaction-trigger.ts:55`) and the reason
+ * is the same here: `turn_end` fires while the agent is still settling, so doing the work inline holds
+ * the turn open. Deferring lets the handler return and the re-check below decide whether the work is
+ * still wanted.
+ *
+ * Injectable, because the deferral is the one part of the observer a test cannot await: with a real
+ * `setTimeout` a test either sleeps and hopes, or asserts nothing.
+ */
+export type Scheduler = (run: () => Promise<void>) => void;
+
+const defaultScheduler: Scheduler = run => {
+  setTimeout(() => { void run(); }, 0);
+};
+
+export default function compactionRouter(pi: ExtensionAPI, options: { workerCall?: WorkerCall; scheduler?: Scheduler } = {}): void {
   const explicitResumeSessions = new Set<string>();
   const sessionOverrides = new Map<string, RouterConfig | null>();
+  /**
+   * The observer's model call. Injectable so a test can count calls and assert the OFF default without
+   * a network, and so the live implementation stays lazily imported.
+   */
+  const workerCall = options.workerCall ?? liveWorkerCall;
+  const schedule = options.scheduler ?? defaultScheduler;
+  /**
+   * POM's re-entrancy guard (`hooks/compaction-hook.ts:17-25`, stealList 8), WITHOUT its `{cancel:true}`.
+   *
+   * Upstream cancels the duplicate compaction. We never return `cancel` from anywhere
+   * (`base-choice-verdict.md` §5.4), so a re-entrant call here declines to do the EXTRA work and lets
+   * the compaction proceed on pi's own terms. Two flags rather than one because the two paths overlap in
+   * time and must not gate each other: a compaction firing while an observer call is in flight should
+   * still get its fold, and an observer run must not be blocked by a compaction it is unrelated to.
+   */
+  const observerInFlight = new Set<string>();
+  const foldInFlight = new Set<string>();
+  /**
+   * Facts recorded this session but not yet visible in `branchEntries`.
+   *
+   * `pi.appendEntry` is asynchronous with respect to what a later event's `branchEntries` carries, and
+   * the compaction that immediately follows an observer run is exactly when that matters. Cleared per
+   * session on shutdown, and reconciled by id against the entries so a fact cannot be counted twice.
+   */
+  const pendingFacts = new Map<string, FactsRecorded[]>();
   /**
    * Passive only. Fed exclusively from results the route loop below already obtained; never consulted
    * by asking a provider anything. See src/provider-health.ts for the upstream rule this holds to.
@@ -213,6 +326,216 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     }
     return config;
   };
+
+  // ── The preservation layer (W5) ───────────────────────────────────────────────────────────────
+  //
+  // Every function below returns early on a default config. That is the property the donemeans test
+  // pins, and it is expressed as `config.preservation.enabled` -- a field `resolvePreservationConfig`
+  // sets to `true` only for a literal boolean `true`.
+
+  /**
+   * The branch, plus any facts appended this session that the branch does not show yet.
+   *
+   * `pi.appendEntry` writes a custom entry, but the `branchEntries` a later event carries is a snapshot
+   * the host built at its own time. A compaction firing in the same turn as an observer run would
+   * otherwise render a fold missing the facts that run just recorded -- the one case where the whole
+   * layer would look broken while working correctly.
+   *
+   * Reconciliation is by fact ID, which is a content hash, so a fact present in both places is counted
+   * once by `readFacts`'s own de-duplication.
+   */
+  const entriesWithPendingFacts = (sessionId: string, branchEntries: readonly unknown[]): LedgerEntry[] => {
+    const entries = branchEntries as LedgerEntry[];
+    const pending = pendingFacts.get(sessionId);
+    if (!pending?.length) return entries;
+    const synthetic: LedgerEntry[] = pending.map((data, index) => ({
+      type: "custom",
+      id: `pending-facts-${index}`,
+      customType: FACTS_RECORDED,
+      data,
+    }));
+    return [...entries, ...synthetic];
+  };
+
+  /**
+   * The `customInstructions` a routed compaction is given: the deterministic fold plus the four
+   * hardening blocks, with the operator's own text quoted as advisory data.
+   *
+   * `undefined` when the layer is off, so the OFF path passes `event.customInstructions` through to
+   * `compact()` exactly as it did before W5 -- the same object, not a rebuilt equivalent. That is what
+   * makes "existing restore tests stay green" a structural fact rather than a hope.
+   */
+  const foldedInstructions = (config: RouterConfig, sessionId: string, event: Pick<SessionBeforeCompactEvent, "customInstructions" | "branchEntries">): string | undefined => {
+    if (!config.preservation.enabled || !config.preservation.injectFold) return event.customInstructions;
+    if (foldInFlight.has(sessionId)) {
+      // POM's re-entrancy guard, minus the cancel. A duplicate declines the extra work; the compaction
+      // still happens, with pi's own instructions.
+      warn("A compaction fold is already in flight for this session; using the unfolded instructions for this one.");
+      return event.customInstructions;
+    }
+    foldInFlight.add(sessionId);
+    try {
+      const fold = renderFold(entriesWithPendingFacts(sessionId, event.branchEntries), config.preservation.maxFacts);
+      if (!fold.text) return event.customInstructions;
+      return buildCompactionCustomInstructions(fold.text, event.customInstructions);
+    } catch (error) {
+      // A fold that cannot be rendered is a lost prompt improvement, never a failed compaction. Same
+      // posture as the ledger and the cooldown file: observability and enrichment must not become new
+      // ways for compaction to break.
+      warn("Could not render the preservation fold; compacting with the unfolded instructions.", error);
+      return event.customInstructions;
+    } finally {
+      foldInFlight.delete(sessionId);
+    }
+  };
+
+  /**
+   * One observer pass. Called only from the deferred, re-checked path below.
+   *
+   * `void launchTask(...)` is upstream POM's shape (`consolidation-trigger.ts:142`) and is half of what
+   * the starvation report is about: an unawaited nested loop on every `turn_end` competing with the
+   * user's own next turn for the same inference slot. The `observerInFlight` guard means a slow worker
+   * call cannot stack up behind itself, which is the bound upstream's single `consolidationInFlight`
+   * boolean provides and its per-`turn_end` launch then undermines.
+   */
+  const observePass = async (ctx: ExtensionContext): Promise<void> => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const config = configFor(ctx);
+    if (!config?.preservation.enabled) return;
+    if (observerInFlight.has(sessionId)) return;
+    observerInFlight.add(sessionId);
+    try {
+      const branch = ctx.sessionManager.getBranch() as unknown as readonly unknown[];
+      const entries = entriesWithPendingFacts(sessionId, branch);
+      const { coversUpToId } = readFacts(entries);
+      const active = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown/unknown";
+      const outcome = await runObserver({
+        config: config.preservation,
+        entries,
+        coversUpToId,
+        tokensSinceCoverage: tokensSinceCoverage(entries, coversUpToId),
+        // Ratio mode is resolved against the ACTIVE model's window, not the worker's: the threshold is
+        // a statement about how much of the user's context has gone unobserved, and the worker's own
+        // window governs the chunk cap instead. Upstream reads `ctx.model.contextWindow` here too.
+        threshold: resolveObserveAfterTokens(config.preservation, ctx.model?.contextWindow),
+        selection: selectWorkerTargets(config, active, {
+          cooldownFor: target => cooldowns.get(target.model, { cooldownHours: cooldownHoursFor(config, target) }),
+        }),
+        findModel: target => {
+          const ref = parseModelReference(target.model);
+          if (!ref) return null;
+          return ctx.modelRegistry.find(ref.provider, ref.modelId) ?? null;
+        },
+        authFor: model => ctx.modelRegistry.getApiKeyAndHeaders(model as Parameters<typeof ctx.modelRegistry.getApiKeyAndHeaders>[0]),
+        call: workerCall,
+        signal: ctx.signal,
+        // The worker shares the compaction path's health record and cooldown store, so a target that
+        // failed as a worker is known to have failed when it is next considered for a compaction, and
+        // vice versa. One provider being down is one fact about that provider.
+        onFailure: (target, classification) => {
+          health.recordFailure(target.model, "call-failed", `${classification.kind}: ${classification.message}`);
+          recordCooldown(cooldowns, config, target, classification, "worker");
+        },
+        onSuccess: target => health.recordSuccess(target.model),
+      });
+
+      if (!outcome.recorded) {
+        // `disabled` and `below-threshold` are the quiet, expected outcomes and must not warn: they
+        // happen on most turns by design. The other five are things an operator can act on.
+        if (outcome.skip && outcome.skip !== "disabled" && outcome.skip !== "below-threshold") {
+          warn(`The observer recorded nothing (${outcome.skip}): ${outcome.reasons.join("; ")}.`);
+        }
+        return;
+      }
+      const data: FactsRecorded = { facts: outcome.recorded.facts, coversUpToId: outcome.recorded.coversUpToId, servedBy: outcome.recorded.servedBy };
+      // The durable record. A custom entry rather than a file: it travels with the session tree, is
+      // replay-safe, survives compaction by construction, and a forked session inherits exactly the
+      // facts its branch recorded. Custom entries do not participate in LLM context
+      // (`registerEntryRenderer`'s contract), so recording a fact costs no tokens until the fold
+      // injects it.
+      pi.appendEntry(FACTS_RECORDED, data);
+      const pending = pendingFacts.get(sessionId) ?? [];
+      pending.push(data);
+      pendingFacts.set(sessionId, pending);
+      if (outcome.recorded.rejected > 0) {
+        // Code-enforced citation, reported. A worker inventing source ids is a quality signal about
+        // that model, and silently dropping the facts would hide it.
+        warn(`'${outcome.recorded.servedBy}' emitted ${outcome.recorded.rejected} fact(s) citing source ids that were not in the chunk; they were discarded.`);
+      }
+    } catch (error) {
+      // Background enrichment must never break a turn.
+      warn("The observer pass failed; the session is unaffected.", error);
+    } finally {
+      observerInFlight.delete(sessionId);
+    }
+  };
+
+  /**
+   * The deferred-and-re-checked trigger — POM stealList 7 (`hooks/compaction-trigger.ts:55-74`).
+   *
+   * Upstream's shape, and both of its re-checks, retargeted from "should I compact" to "should I
+   * observe":
+   *
+   *  1. **`setTimeout(0)`, then re-assert idleness.** `turn_end` fires while the turn is still
+   *     settling. Upstream defers and then re-checks `ctx.isIdle()`, because the agent can become busy
+   *     again in between -- a queued message, a follow-up turn -- and the deferred work is no longer
+   *     wanted. Observing while the agent is streaming is exactly the contention the starvation report
+   *     describes, so the check earns its place here more than upstream's did.
+   *  2. **Re-check the threshold against fresh state.** Upstream re-reads its entries and re-compares
+   *     against the threshold, because another compaction may have run in the gap. Ours re-reads the
+   *     coverage marker for the analogous reason: a compaction, a fork, or a concurrent observer pass
+   *     may have advanced it, and paying for a chunk that has already been observed is pure waste.
+   *
+   * Both re-checks say why they declined. Upstream notifies the operator; ours warns, because
+   * `console.warn` is where every other diagnostic in this package goes and a routine skip must not
+   * put a dialog in front of someone.
+   */
+  const observeDeferred = (ctx: ExtensionContext): void => {
+    const config = configFor(ctx);
+    if (!config?.preservation.enabled) return;
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (observerInFlight.has(sessionId)) return;
+
+    // Captured synchronously, before the deferral: upstream's own comment says why ("the setTimeout +
+    // async work below may outlive the extension ctx (stale after session replacement/reload)").
+    const branchAtTrigger = ctx.sessionManager.getBranch() as unknown as readonly unknown[];
+    const entriesAtTrigger = entriesWithPendingFacts(sessionId, branchAtTrigger);
+    const threshold = resolveObserveAfterTokens(config.preservation, ctx.model?.contextWindow);
+    if (tokensSinceCoverage(entriesAtTrigger, readFacts(entriesAtTrigger).coversUpToId) < threshold) return;
+
+    schedule(async () => {
+      try {
+        if (!ctx.isIdle()) {
+          warn("Observation deferred: the agent became busy before the deferred observer pass ran.");
+          return;
+        }
+        // Upstream's SECOND re-check -- re-read the entries and re-compare against the threshold
+        // (`compaction-trigger.ts:66-73`) -- is not written here, because in this structure it already
+        // happens one call down: `observePass` re-reads the branch and the coverage marker and hands the
+        // freshly measured backlog to `runObserver`, which returns `below-threshold` without calling
+        // anything. A compaction, a fork, or another pass that ran in the gap is therefore caught, on
+        // fresh state, by the one place the threshold is enforced.
+        //
+        // Writing it again here was the first draft, and it was the cooldown mistake in a second costume:
+        // a duplicated guard whose copy is unreachable in production, so a mutation deleting the REAL
+        // enforcement stays green while the redundant copy covers for it. One enforcement point, tested.
+        //
+        // Also rejected, and worth naming because it is the tempting version: comparing the coverage
+        // marker and declining when it MOVED. That is wrong where it differs from measuring the backlog --
+        // a marker that advanced part-way while a large backlog remains is a reason to observe the rest,
+        // not to abandon it. The `PARTIALLY consumed backlog` test pins that distinction.
+        await observePass(ctx);
+      } catch (error) {
+        // A deferred callback throws into no caller. Swallowing it here after one warning is what keeps
+        // an observer failure from becoming an unhandled rejection that takes the host with it.
+        warn("The deferred observer pass failed; the session is unaffected.", error);
+      }
+    });
+  };
+
+  pi.on("turn_end", (_event, ctx) => {
+    observeDeferred(ctx);
+  });
 
   pi.on("session_before_compact", async (event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
@@ -252,6 +575,10 @@ export default function compactionRouter(pi: ExtensionAPI): void {
 
     restorePreviousFileOperations(event.preparation, event.branchEntries);
     const estimated = estimatedInputTokens(event.preparation);
+    // The W5 fold. Rendered ONCE per compaction, not per target: it is a pure function of the branch
+    // entries, so a three-hop chain must not fold three times. With the layer off this is
+    // `event.customInstructions` itself, unchanged and unwrapped.
+    const customInstructions = foldedInstructions(config, sessionId, event);
     // Read once per compaction, not once per target: this is a settings file read, and a route chain
     // must not re-read it per hop. Hoisted out of the loop below for a second reason -- inside the
     // try/catch it would report a settings failure as "compaction with this target failed", sending
@@ -290,7 +617,7 @@ export default function compactionRouter(pi: ExtensionAPI): void {
         // single transient stream drop cost the whole route hop where pi would have retried. Both
         // layers are wanted: pi's retry is inside one `compact()` call, ours survives it throwing.
         const result = await withTargetRetry(
-          () => compact(event.preparation, model, auth.apiKey, auth.headers, event.customInstructions, event.signal, target.thinkingLevel, undefined, auth.env, retry),
+          () => compact(event.preparation, model, auth.apiKey, auth.headers, customInstructions, event.signal, target.thinkingLevel, undefined, auth.env, retry),
           {
             maxRetries: config.maxRetries,
             signal: event.signal,
@@ -391,6 +718,44 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     pi.sendMessage({ customType: "compaction-router-resume", content: config.resume.message, display: true }, { deliverAs: "followUp", triggerTurn: true });
   });
 
+  /**
+   * `recall` — exchange a fact id for its verbatim source (POM stealList 3).
+   *
+   * Registered UNCONDITIONALLY, and that is deliberate. A tool's presence is decided when the
+   * extension loads, and settings can change mid-session: gating registration on
+   * `preservation.enabled` would mean an operator who enables the layer gets folds citing ids that no
+   * tool can resolve until they restart. Registering always and answering honestly is the cheaper
+   * contract -- with the layer off the ledger has no facts, so every call returns `not_found` with a
+   * message saying so, which costs a tool slot and nothing else.
+   *
+   * Named `recall-fact`, not `recall`: POM claims the bare `recall` name (`RECALL_OBSERVATION_TOOL_NAME`,
+   * `tools/recall-observation.ts:16`) and `dive-pi-observational-memory.md` §6 flags it as generic
+   * enough to want checking against `pi-memory-layers`' `memory` tool. Tool names are first-registration
+   * wins (`runner.js:278-282`), so a collision would silently give the model somebody else's tool under
+   * a name our fold taught it. A namespaced name cannot.
+   */
+  pi.registerTool({
+    name: "recall-fact",
+    label: "Recall fact source",
+    description:
+      "Exchange a 12-hex fact id from the RECORDED FACTS section of a compaction summary for the verbatim source it was drawn from. " +
+      "Use it when a fact materially affects a decision or is too compressed to act on confidently. Do not use it as a broad search.",
+    parameters: Type.Object({
+      factId: Type.String({ minLength: 12, maxLength: 12, description: "The 12-character hexadecimal id printed in brackets at the start of a recorded fact." }),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const sessionId = ctx.sessionManager.getSessionId();
+      const branch = ctx.sessionManager.getBranch() as unknown as readonly unknown[];
+      const result = recallFact(entriesWithPendingFacts(sessionId, branch), params.factId);
+      return {
+        content: [{ type: "text", text: formatRecallResult(result) }],
+        // The structured half, so a renderer or a test reads the outcome rather than parsing prose.
+        details: { status: result.status, factId: result.factId, collision: result.collision, dropped: result.dropped, sources: result.sources.length, missing: result.missingSourceEntryIds.length },
+        isError: result.status === "invalid_id" || result.status === "not_found",
+      };
+    },
+  });
+
   pi.registerCommand("compact-resume", {
     description: "Compact with the configured router, then resume the in-progress task",
     handler: async (args, ctx) => {
@@ -434,6 +799,10 @@ export default function compactionRouter(pi: ExtensionAPI): void {
       const meter = formatSavingsRows(readSavings(getAgentDir(), sessionId, ctx.cwd));
       const healthRows = formatHealthRows(health.snapshotAll());
       const blocks = [`Active: ${active}`, `Source: ${source}`, ...lines, `Auto-resume: ${config.resume.reasons.join(", ") || "off"}`];
+      // The preservation layer's own row, so its state is legible without reading settings. Says "off"
+      // rather than being absent, because "off" is the default and an operator debugging a missing fold
+      // needs to see the default stated rather than inferred from silence.
+      blocks.push(...preservationStatusRows(config, ctx));
       if (cooled.length) blocks.push("", "Cooldowns:", ...cooled.map(l => `  ${l}`));
       if (meter.length) blocks.push("", ...meter);
       if (healthRows.length) blocks.push("", ...healthRows);
@@ -595,6 +964,13 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     clearPendingWarning(sessionId);
     clearRouteRecord(sessionId);
     clearNotRoutedWidget(ctx);
+    // The preservation layer's per-session state. The FACTS are durable and stay in the session tree;
+    // what is dropped here is the not-yet-visible mirror and the two in-flight guards, all of which
+    // describe this process's view of this session and would be wrong for the next one. A guard left set
+    // by a session that ended mid-call would silently disable folding for every later session.
+    pendingFacts.delete(sessionId);
+    observerInFlight.delete(sessionId);
+    foldInFlight.delete(sessionId);
     // The memory-only cooldowns are this process's knowledge of what failed, and a new session is
     // entitled to try again. The persisted half is untouched: a rate limit outlives a session, which
     // is the entire reason it is on disk. Also sweeps expired entries, upstream's `expireCooldowns()`
@@ -608,7 +984,10 @@ export * from "./chain.js";
 export * from "./config.js";
 export * from "./cooldown.js";
 export * from "./ledger.js";
+export * from "./observer.js";
 export * from "./pending-warning.js";
+export * from "./preservation.js";
+export * from "./preservation-prompt.js";
 export * from "./provider-health.js";
 export * from "./model-picker.js";
 export * from "./retry.js";
