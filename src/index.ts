@@ -1,8 +1,12 @@
 import { compact, convertToLlm, getAgentDir, serializeConversation, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionCompactEvent } from "@earendil-works/pi-coding-agent";
-import { configToSettingsValue, loadConfig, loadRetryPolicy, parseModelReference, parseSessionOverride, selectTargets, type CompactionReason, type RouterConfig } from "./config.js";
+import { advancesChain, chainExhausted, chainHalt, type ChainStop } from "./chain.js";
+import { configToSettingsValue, cooldownHoursFor, loadConfig, loadRetryPolicy, parseModelReference, parseSessionOverride, type CompactionReason, type ModelTarget, type RouterConfig } from "./config.js";
+import { CooldownStore } from "./cooldown.js";
 import { ACTIVE_MODEL_TARGET, appendRow, clearRouteRecord, estimateSummaryTokens, formatSavingsRows, readSavings, setRouteRecord, takeRouteRecord, type LedgerRow, type RouteRecord, type ServingTarget } from "./ledger.js";
 import { clearPendingWarning, setPendingWarning, takePendingWarning } from "./pending-warning.js";
 import { formatHealthRows, ProviderHealth } from "./provider-health.js";
+import { classifyFailure, withTargetRetry, type Classification } from "./retry.js";
+import { checkMaxTokens, findRouteShadowing, selectTargets, type Suppressor } from "./selection.js";
 
 /** Pi's `CompactionPreparation`, reached through the event that carries it rather than re-declared. */
 type Preparation = SessionBeforeCompactEvent["preparation"];
@@ -116,6 +120,49 @@ function writeLedgerRow(
   appendRow(getAgentDir(), row, warn);
 }
 
+/**
+ * The durable banner for a compaction no target was even attempted for.
+ *
+ * `no-targets-configured` is deliberately not given a banner by the caller: a package with no
+ * configuration owes no warning, which is the existing contract the fail-open tests pin. The other two
+ * suppressors are outcomes the operator configured FOR and did not get.
+ *
+ * Pi renders at most 10 widget lines (`InteractiveMode.MAX_WIDGET_LINES`, `interactive-mode.js:1531`)
+ * and silently drops the rest, so the detail lines are capped where a reader can still see the cap.
+ */
+function suppressorLines(suppressor: Suppressor, reason: string, reasons: string[]): string[] {
+  const head = suppressor === "all-targets-cooled-down"
+    ? [
+        `[${TAG}] compaction was NOT routed: every configured target is in a cooldown window from`,
+        `an earlier failure, so Pi's active model handled this ${reason} compaction instead.`,
+        `Cooldowns expire on their own; delete the router's cooldown.json to clear them now.`,
+      ]
+    : [
+        `[${TAG}] compaction was NOT routed: no route covers a '${reason}' compaction and no`,
+        `fallback models are configured, so Pi's active model handled it. Add '${reason}' to a`,
+        `route's reasons, or set fallback models, if this was meant to be routed.`,
+      ];
+  return [...head, ...reasons.slice(0, 10 - head.length - 1).map(line => `- ${line}`)];
+}
+
+/**
+ * Hold a failure against the target, if it is the target's to answer for.
+ *
+ * The classifier decides (`cooldownWorthy`), not this function: `stale-context` and `aborted` must
+ * never cool a target down, and that judgement belongs next to the classification rather than
+ * duplicated at each call site. The stage string is the compaction reason plus the failure class,
+ * because an operator reading the file needs to know whether a target was cooled by a rate limit
+ * during an overflow or by an exhausted budget.
+ */
+function recordCooldown(store: CooldownStore, config: RouterConfig, target: ModelTarget, classification: Classification, reason: string): void {
+  if (!classification.cooldownWorthy) return;
+  store.record(target.model, {
+    reason: classification.message,
+    stage: `${reason}/${classification.kind}`,
+    cooldownHours: cooldownHoursFor(config, target),
+  });
+}
+
 export default function compactionRouter(pi: ExtensionAPI): void {
   const explicitResumeSessions = new Set<string>();
   const sessionOverrides = new Map<string, RouterConfig | null>();
@@ -124,9 +171,26 @@ export default function compactionRouter(pi: ExtensionAPI): void {
    * by asking a provider anything. See src/provider-health.ts for the upstream rule this holds to.
    */
   const health = new ProviderHealth();
+  /**
+   * One store for the process, because its `cooldownHours: 0` half is in-memory by definition and a
+   * per-call store would forget it instantly -- silently un-doing the one semantic that setting exists
+   * for. The persisted half reads the file per call regardless, so nothing else is cached here.
+   */
+  const cooldowns = new CooldownStore();
+  /** Config objects already checked for route shadowing, so the warning is emitted once, not per compaction. */
+  const shadowingReported = new WeakSet<RouterConfig>();
+
+
   const configFor = (ctx: Parameters<typeof loadConfig>[0]): RouterConfig | null => {
     const sessionId = ctx.sessionManager.getSessionId();
-    return sessionOverrides.has(sessionId) ? sessionOverrides.get(sessionId)! : loadConfig(ctx);
+    const config = sessionOverrides.has(sessionId) ? sessionOverrides.get(sessionId)! : loadConfig(ctx);
+    if (config && !shadowingReported.has(config)) {
+      shadowingReported.add(config);
+      // Dead configuration is worth exactly one warning. A route that can never be reached is a rule
+      // the operator wrote and the file kept; saying so every compaction would train them to ignore it.
+      for (const shadow of findRouteShadowing(config)) warn(shadow.message);
+    }
+    return config;
   };
 
   pi.on("session_before_compact", async (event, ctx) => {
@@ -144,11 +208,24 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     const config = configFor(ctx);
     if (!config) return;
     const active = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown/unknown";
-    const targets = selectTargets(config, active, event.reason);
-    // "Never silent": configuration exists but nothing matched this reason and active model. That is
-    // a fact about routing, so it is recorded rather than being an absent row a reader must guess at.
+    const selection = selectTargets(config, active, event.reason, {
+      cooldownFor: target => cooldowns.get(target.model, { cooldownHours: cooldownHoursFor(config, target) }),
+    });
+    const targets = selection.fire;
     if (!targets.length) {
+      // "Never silent", in both registers. The ledger gets a `no-targets` row rather than an absent one
+      // a reader must guess at; the operator gets a suppressor naming which of the four ways this
+      // happened it was. An empty target list used to be a bare `return` that produced neither.
+      //
+      // The two suppressors that mean "this package HAD an opinion and was thwarted" also get the
+      // durable banner: a cooled-down chain and a reason the operator's routes do not cover are both
+      // things they can act on, and neither is inferable from anything else they can see.
       setRouteRecord(sessionId, { outcome: "no-targets", servedBy: ACTIVE_MODEL_TARGET, window: ctx.model?.contextWindow ?? null, tokensBefore });
+      for (const reason of selection.reasons) warn(reason);
+      warn(`No route target will be tried for this ${event.reason} compaction (${selection.suppressor}).`);
+      if (!event.signal.aborted && selection.suppressor !== "no-targets-configured") {
+        setPendingWarning(sessionId, { lines: suppressorLines(selection.suppressor!, event.reason, selection.reasons), routedByExtension: false });
+      }
       return;
     }
 
@@ -160,6 +237,7 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     // the operator after the wrong thing. `configFor` above already read the same file, so this adds
     // no failure mode that was not already present.
     const retry = loadRetryPolicy(ctx);
+    let stop: ChainStop = chainExhausted(targets.length);
 
     for (const target of targets) {
       const ref = parseModelReference(target.model);
@@ -174,14 +252,30 @@ export default function compactionRouter(pi: ExtensionAPI): void {
         warn(`Skipping '${target.model}': conservative ${estimated}-token input estimate plus ${reserve} reserved tokens exceeds its ${model.contextWindow}-token context window.`);
         continue;
       }
+      // The output side of the same arithmetic. Pi will ask for `0.8 x reserveTokens` output tokens
+      // and silently `min()` it against the model's own cap, so a target with a small `maxTokens`
+      // truncates its summary with nothing said anywhere. Warn always; skip only when the shortfall
+      // is severe (see MAX_TOKENS_REFUSAL_FRACTION, which is labelled a guess).
+      const budget = checkMaxTokens(model, reserve, target.model);
+      if (budget.message) warn(budget.message);
+      if (budget.refuse) continue;
       try {
         const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
         if (!auth.ok) { health.recordFailure(target.model, "unauthenticated", auth.error); warn(`Skipping unauthenticated model '${target.model}': ${auth.error}.`); continue; }
+        // Retry THIS target before advancing: one `server_is_overloaded` used to cost the whole hop.
         // Arg 10 is `retry`. Pi passes its own `settingsManager.getRetrySettings()` on both native
         // compaction paths (`dist/core/agent-session.js:1423`, `1662`); omitting it here meant a
         // routed compaction was the one summarization call in the process with retry disabled, so a
-        // single transient stream drop cost the whole route hop where pi would have retried.
-        const result = await compact(event.preparation, model, auth.apiKey, auth.headers, event.customInstructions, event.signal, target.thinkingLevel, undefined, auth.env, retry);
+        // single transient stream drop cost the whole route hop where pi would have retried. Both
+        // layers are wanted: pi's retry is inside one `compact()` call, ours survives it throwing.
+        const result = await withTargetRetry(
+          () => compact(event.preparation, model, auth.apiKey, auth.headers, event.customInstructions, event.signal, target.thinkingLevel, undefined, auth.env, retry),
+          {
+            maxRetries: config.maxRetries,
+            signal: event.signal,
+            onRetry: notice => warn(`Retrying '${target.model}' after a ${notice.classification.kind} failure (attempt ${notice.attempt}): ${notice.classification.message}. Waiting ${notice.delayMs}ms.`),
+          },
+        );
         health.recordSuccess(target.model);
         // WHICH TARGET SERVED IT -- the field pi's own compaction entry does not carry. Stashed for
         // session_compact, which owns the other half of the row (reason, willRetry, committed usage).
@@ -193,17 +287,29 @@ export default function compactionRouter(pi: ExtensionAPI): void {
         });
         return { compaction: result };
       } catch (error) {
-        if (event.signal.aborted) {
-          // An abort is not a target failure: the target never got the chance to fail. Recording it
-          // as one would make an aborted session look like a flapping provider to W2's selection.
+        const classification = classifyFailure(error);
+        recordCooldown(cooldowns, config, target, classification, event.reason);
+        if (classification.kind === "aborted" || event.signal.aborted) {
+          // An abort is not a target failure: the target never got the chance to fail. Recording it as
+          // one would make an aborted session look like a flapping provider to route selection -- which
+          // is why `classifyFailure` gives it its own class and `recordCooldown` above declines it.
           setRouteRecord(sessionId, { outcome: "aborted", servedBy: ACTIVE_MODEL_TARGET, window: ctx.model?.contextWindow ?? null, tokensBefore });
           return;
         }
-        health.recordFailure(target.model, "call-failed", error instanceof Error ? error.message : String(error));
-        warn(`Compaction with '${target.model}' failed; trying the next route target.`, error);
+        // The health record carries the classification, not the raw throw: "quota" and "overloaded" are
+        // the same `call-failed` to the ledger's taxonomy but very different things to read in a status.
+        health.recordFailure(target.model, "call-failed", `${classification.kind}: ${classification.message}`);
+        if (!advancesChain(classification)) {
+          // Magic Context's rule: a failure that is not ABOUT THE TARGET travels with the request, so
+          // the next target would fail identically. Stop rather than burn the list.
+          stop = chainHalt(classification);
+          warn(`Compaction with '${target.model}' failed (${classification.kind}); ${stop.message}.`, error);
+          break;
+        }
+        warn(`Compaction with '${target.model}' failed (${classification.kind}); trying the next route target.`, error);
       }
     }
-    warn("No routed model succeeded; falling back to Pi's active model and native handler.");
+    warn(`No routed model succeeded (${stop.message}); falling back to Pi's active model and native handler.`);
     // The fallback is deliberately FAIL-OPEN: refusing to compact would end the session, which is a worse
     // outcome than compacting with the active model. But fail-open must not mean unobserved. console.warn
     // goes to a stream the interactive TUI does not surface, so without an operator-visible report an
@@ -230,6 +336,9 @@ export default function compactionRouter(pi: ExtensionAPI): void {
           `[${TAG}] compaction was NOT routed: all ${targets.length} configured target(s) were skipped`,
           `or failed, so Pi's active model handled it instead. An unavailable, unauthenticated or`,
           `too-small target is a configuration problem rather than a transient one.`,
+          // Why the chain ended where it did. Without this, "all N targets" reads as "all N were
+          // tried", which a halted chain did not do -- and the halt is the more actionable outcome.
+          `Cause: ${stop.message}.`,
         ],
         routedByExtension: false,
       });
@@ -283,18 +392,34 @@ export default function compactionRouter(pi: ExtensionAPI): void {
       const config = configFor(ctx);
       if (!config) { ctx.ui.notify(`pi-compaction-router is disabled${sessionOverrides.has(sessionId) ? " by this session's override" : " or has no valid routes"}.`, "warning"); return; }
       const active = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown/unknown";
-      const lines = (["manual", "threshold", "overflow"] as CompactionReason[]).map(reason => `${reason}: ${selectTargets(config, active, reason).map(x => `${x.model}${x.thinkingLevel ? `:${x.thinkingLevel}` : ""}`).join(" -> ") || "Pi active model"}`);
+      const lines = (["manual", "threshold", "overflow"] as CompactionReason[]).map(reason => {
+        const selection = selectTargets(config, active, reason, {
+          cooldownFor: target => cooldowns.get(target.model, { cooldownHours: cooldownHoursFor(config, target) }),
+        });
+        // The suppressor is the point of showing this at all: "threshold: Pi active model" was
+        // indistinguishable from "threshold: cooled down, waiting", and those are different problems.
+        return selection.fire.length
+          ? `${reason}: ${selection.fire.map(x => `${x.model}${x.thinkingLevel ? `:${x.thinkingLevel}` : ""}`).join(" -> ")}`
+          : `${reason}: Pi active model (${selection.suppressor})`;
+      });
+      const cooled = Object.entries(cooldowns.snapshot()).map(([key, entry]) => `${key} until ${entry.until} (${entry.stage}: ${entry.reason})`);
+      const shadowing = findRouteShadowing(config).map(s => s.message);
       const source = sessionOverrides.has(sessionId) ? "session override" : "settings";
       // This command showed CONFIGURATION only. Configuration is what routing was ASKED to do; the
       // savings block below is what it actually did -- the meter for "what did routing buy" (AFT
       // 566bcde stealList 4). Both blocks degrade to nothing rather than to a row of zeroes: before
-      // any compaction has been measured there is no honest number to show.
+      // any compaction has been measured there is no honest number to show. The cooldown and shadowing
+      // blocks follow the same rule: absent when there is nothing to report.
       const meter = formatSavingsRows(readSavings(getAgentDir(), sessionId, ctx.cwd));
       const healthRows = formatHealthRows(health.snapshotAll());
       const blocks = [`Active: ${active}`, `Source: ${source}`, ...lines, `Auto-resume: ${config.resume.reasons.join(", ") || "off"}`];
+      if (cooled.length) blocks.push("", "Cooldowns:", ...cooled.map(l => `  ${l}`));
       if (meter.length) blocks.push("", ...meter);
       if (healthRows.length) blocks.push("", ...healthRows);
-      ctx.ui.notify(blocks.join("\n"), "info");
+      // Dead configuration is the one thing here that is a defect rather than a report, so it raises the
+      // notification's level as well as appearing in it.
+      if (shadowing.length) blocks.push("", ...shadowing.map(l => `WARNING: ${l}`));
+      ctx.ui.notify(blocks.join("\n"), shadowing.length ? "warning" : "info");
     },
   });
 
@@ -333,10 +458,21 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     clearPendingWarning(sessionId);
     clearRouteRecord(sessionId);
     clearNotRoutedWidget(ctx);
+    // The memory-only cooldowns are this process's knowledge of what failed, and a new session is
+    // entitled to try again. The persisted half is untouched: a rate limit outlives a session, which
+    // is the entire reason it is on disk. Also sweeps expired entries, upstream's `expireCooldowns()`
+    // on a session boundary -- lazy expiry already keeps correctness, this keeps the file readable.
+    cooldowns.clearMemory();
+    cooldowns.expire();
   });
 }
 
+export * from "./chain.js";
 export * from "./config.js";
+export * from "./cooldown.js";
 export * from "./ledger.js";
 export * from "./pending-warning.js";
 export * from "./provider-health.js";
+export * from "./retry.js";
+export * from "./retryable-error.js";
+export * from "./selection.js";

@@ -41,6 +41,8 @@ Add `compactionRouter` to global `~/.pi/agent/settings.json` or trusted project 
     "models": [
       { "model": "anthropic/claude-sonnet-4-5", "thinkingLevel": "low" }
     ],
+    "maxRetries": 3,
+    "cooldownHours": 1,
     "resume": {
       "enabled": false,
       "reasons": ["manual", "threshold"]
@@ -49,11 +51,24 @@ Add `compactionRouter` to global `~/.pi/agent/settings.json` or trusted project 
 }
 ```
 
-- The first matching route wins.
+- The first matching route wins. There is no specificity ordering, so a general pattern placed before a specific one makes the specific route dead configuration — `anthropic/*` before `anthropic/claude-opus-*` means the second route is never used. The extension warns about this once per configuration and `/compaction-router` shows it.
 - `models` at the router root is the fallback route.
 - Each model is tried in order. If all fail, the extension returns control to Pi's native active-model handler.
 - Missing models, missing authentication, and models too small to hold the summarization prompt are skipped. The fit check measures the artifact Pi actually sends — `serializeConversation(convertToLlm(...))`, in which every tool result is truncated to 2 000 characters — not the raw message objects.
+- A target whose output cap cannot hold the summary Pi is about to ask for is warned about, and skipped when the shortfall is severe. Pi asks for `0.8 × reserveTokens` output tokens and silently caps that at the model's own `maxTokens`, so with a raised `reserveTokens` a small-output model truncates its summary with nothing said anywhere.
 - `overflow` never receives an extra resume turn because Pi already retries the interrupted request.
+
+### Retry and cooldowns
+
+A failed target is now classified rather than simply abandoned:
+
+- **Transient failures are retried on the same target** before the chain advances — `maxRetries` (default 3) attempts with exponential backoff, capped at 60 seconds per wait. Cancelling a compaction interrupts the backoff immediately rather than after it elapses.
+- **Quota and billing failures are never retried.** `insufficient_quota` will not change in the next second, and spending four attempts on it costs four rate-limit windows.
+- **A provider asking to be retried later than 60 seconds is failed fast**, and the chain moves to the next target. Sleeping fifteen minutes inside a compaction is worse than failing over when there is another target to reach.
+- **The chain stops rather than advancing** when the failure is not about the target: a cancelled compaction, or Pi replacing the session under the extension. Both would fail identically on every remaining target.
+- **A target that keeps failing is cooled down** for `cooldownHours` (default 1) and skipped by later compactions, instead of being retried on every single one. Cooldowns are recorded per `provider/model` in `<agent dir>/pi-compaction-router/cooldown.json` with the reason and the compaction stage, expire on their own, and can be cleared by deleting the file. `/compaction-router` lists the active ones.
+- **`cooldownHours: 0`, per target or router-wide, keeps cooldowns in memory only** — the target is skipped for the rest of the process and nothing is written to disk. Use it on a read-only or ephemeral home.
+- A misconfiguration (a bad request, an unsupported thinking level) is *not* cooled down: waiting does not fix it, and hiding the target would hide the error.
 
 Settings are re-read at every compaction, so global or trusted project changes take effect during the current session without `/reload`.
 
@@ -197,7 +212,9 @@ compaction assertion as a broken probe, not evidence about the router.
 - The context-fit estimate still rounds up (characters ÷ 4, the same heuristic Pi uses) and is not exact provider tokenization. It is a fit guard, not billing.
 - Model fallback after a failed provider call can incur partial provider cost.
 - Routed compactions are passed the host's own `settings.retry` policy, so a transient stream drop is retried before the route advances — the same policy Pi's native compaction runs with.
-- If every configured target is skipped or throws, the hook returns control to Pi's native active-model handler: this is **fail-open**, not fail-closed. That outcome is reported to the operator as a widget above the editor, raised after the compaction commits and retracted by the next one. It is not a `notify`: Pi clears and rebuilds the chat container on `compaction_end`, which destroys anything the before-hook put there.
+- If every configured target is skipped or throws, the hook returns control to Pi's native active-model handler: this is **fail-open**, not fail-closed. That outcome is reported to the operator as a widget above the editor, raised after the compaction commits and retracted by the next one. It is not a `notify`: Pi clears and rebuilds the chat container on `compaction_end`, which destroys anything the before-hook put there. The same widget reports the two cases where no target was even attempted — every target cooling down, or no route covering this compaction reason — because those are indistinguishable from a working compaction otherwise.
+- Cooldowns are advisory and best-effort. A read-only or full filesystem loses them silently rather than failing the compaction, which means a rate-limited target may be tried again sooner than configured.
+- The severe-truncation threshold for the `maxTokens` guard (half of Pi's requested summary budget) is an uncalibrated guess, and is labelled as one in `src/selection.ts`. Nothing has measured where the real line is.
 - Automatic resume does not prove that unfinished work exists; leave it disabled if strict turn control matters.
 
 ## Development
@@ -209,4 +226,16 @@ bun run check
 
 ## Attribution
 
-The native compaction integration and restoration of prior file-operation details are adapted from [JMHSV/pi-compaction-model](https://github.com/JMHSV/pi-compaction-model), MIT licensed. The ledger's closed outcome taxonomy is adapted from [a-Fig/Accordion](https://github.com/a-Fig/Accordion); the tokenize-cost cap, the honest skip flag and the savings telemetry from [cortexkit/aft](https://github.com/cortexkit/aft); the passive provider-health record from [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory). All MIT licensed, all read at pinned commits rather than published tarballs. See [`NOTICE`](./NOTICE) and [`LICENSE`](./LICENSE) for the commit SHAs and the precise scope of each adaptation.
+The native compaction integration and restoration of prior file-operation details are adapted from [JMHSV/pi-compaction-model](https://github.com/JMHSV/pi-compaction-model), MIT licensed.
+
+Also adapted, all MIT licensed, each read at a named commit rather than a published tarball, each with a per-file provenance header naming the upstream file and what diverges:
+
+- [algal/pi-openai-server-compaction](https://github.com/algal/pi-openai-server-compaction) PR #7 — the durable post-compaction warning, and the retry classifier, `retry-after` handling, 60-second ceiling and abort-inside-the-sleep in `src/retry.ts`.
+- [JMHSV/pi-blackhole](https://github.com/JMHSV/pi-blackhole) — persisted per-model cooldowns and the retryable/stale-context predicates.
+- [cortexkit/pi-magic-context](https://github.com/cortexkit/pi-magic-context) — the failure-class allow-list that gates advancing a fallback chain.
+- [XTSoftwareLabs/neatcontext-plugins](https://github.com/XTSoftwareLabs/neatcontext-plugins) — the suppressor taxonomy, so declining to route says why.
+- [a-Fig/Accordion](https://github.com/a-Fig/Accordion) — the ledger's closed outcome taxonomy.
+- [cortexkit/aft](https://github.com/cortexkit/aft) — the tokenize-cost cap, the honest skip flag, and the savings telemetry.
+- [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) — the passive provider-health record.
+
+See [`NOTICE`](./NOTICE) and [`LICENSE`](./LICENSE) for the commit SHAs and the precise scope of each adaptation.
