@@ -17,9 +17,17 @@ before-compaction ui.notify is destroyed by the post-compaction chat rebuild, so
 operator-visible warning has to be re-emitted afterwards as a ui.setWidget widget -- are
 adapted from that project's src/state.ts and src/index.ts. The finding was re-verified
 against this project's own pinned @earendil-works/pi-coding-agent 0.81.1 rather than
-adopted on the upstream author's word. Nothing else from that project is used here: its
-WebSocket transport, provider takeover, Codex identity headers and remote-compaction
-protocol are all out of scope for a router.
+adopted on the upstream author's word.
+
+The per-target retry layer in src/retry.ts is also adapted from that project's
+src/remote-compaction.ts at the same PR #7 head: the RemoteCompactionError shape (here
+RouteAttemptError), the retryable/non-retryable classifier pair whose quota pattern vetoes
+retry, retryAfterDelayMs's preference for retry-after-ms over retry-after with an HTTP-date
+fallback, the 60-second ceiling past which a provider's requested delay is failed fast
+rather than slept, and sleepForRemoteCompactionRetry's abort-inside-the-sleep with
+removeEventListener cleanup and a synthesized AbortError. Nothing else from that project is
+used here: its WebSocket transport, provider takeover, Codex identity headers and
+remote-compaction protocol are all out of scope for a router.
 
 This project also adapts portions of Accordion:
 https://github.com/a-Fig/Accordion
@@ -78,3 +86,41 @@ and the snapshot-as-wire-format split. Upstream's provider-role decorator become
 per-target record here, because a route chain is a list of targets rather than a pair of
 roles. Upstream's daemon substrate, embedding provider, consolidation prompts and eval
 harness are not used.
+
+This project also adapts portions of pi-blackhole:
+https://github.com/JMHSV/pi-blackhole
+Copyright (c) 2026 the pi-blackhole authors, licensed under the MIT License.
+Read at commit 2bf8cda11585c21fef2e5c2d9210690d82a2f2ca -- not from a published tarball.
+
+src/cooldown.ts adapts that project's src/om/cooldown.ts: the {until, reason, stage} entry
+shape, the agent-dir-relative JSON file, expiry-on-read, expireCooldowns, and the
+cooldownHours: 0 "in-memory only, never touch the disk" semantic -- together with the
+in-memory failedInCycle half of src/om/runtime.ts, which is what makes that semantic mean
+anything. src/retryable-error.ts adapts src/om/retryable-error.ts: RETRYABLE_ERROR_RE,
+isRetryableError, and isStaleExtensionContextError, whose lesson is that a session-replacement
+error must never be recorded against a model. The per-file upstream-provenance header
+convention this file's siblings follow is also that project's practice. Not taken: its
+extractive compile() pipeline, its observational-memory ledger and background workers, and
+its settings TUI.
+
+This project also adapts a mechanism from pi-magic-context:
+https://github.com/cortexkit/pi-magic-context
+Copyright (c) 2026 cortexkit, licensed under the MIT License.
+Read at commit 7d2230612a22d28f01c38d88e2578cb0c0ffaf2c -- not from a published tarball.
+
+src/chain.ts adapts the isFallbackEligible rule from that project's
+packages/pi-plugin/src/subagent-runner.ts: advance a fallback chain only on an explicit
+allow-list of failure classes, and stop on anything else, so a failure that travels with the
+request cannot burn the whole model list. The failure vocabulary is this project's own.
+
+This project also adapts a mechanism from neatcontext-plugins:
+https://github.com/XTSoftwareLabs/neatcontext-plugins
+Copyright (c) 2026 XTSoftwareLabs, licensed under the MIT License.
+Read at commit 5b1c750aed83da604c93814081b9daf7267d39f7 -- not from a published tarball.
+
+The suppressor taxonomy in src/selection.ts adapts evaluateSaveNudge from that project's
+plugins/claude-code/neatcontext/src/core/save-nudge.mjs: a decision returned as
+{fire, reasons, suppressor} with a closed set of named suppressors, so that declining to act
+says why and is testable without a host. The suppressor names are this project's own. Its
+practice of labelling an uncalibrated threshold as a guess is followed for
+MAX_TOKENS_REFUSAL_FRACTION.
