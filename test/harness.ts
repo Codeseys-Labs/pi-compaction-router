@@ -94,8 +94,6 @@ export interface Host {
   hasHandler(name: string): boolean;
   readonly ui: FakeInteractiveUI;
   readonly ctx: Record<string, unknown>;
-  /** Calls captured from `compact()`, when the caller stubbed it. */
-  readonly compactCalls: unknown[][];
 }
 
 /**
@@ -142,7 +140,6 @@ export async function withHost<T>(
       hasHandler: name => handlers.has(name),
       ui,
       ctx,
-      compactCalls: [],
     };
     return await body(host);
   } finally {
