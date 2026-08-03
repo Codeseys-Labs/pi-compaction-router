@@ -108,6 +108,141 @@ export function selectTargets(config: RouterConfig, activeModel: string, reason:
   return { fire, reasons: [...reasons, ...cooled], suppressor: null };
 }
 
+// ── Fit-aware selection: cheapest that fits (G6) ─────────────────────────────────────────────────
+
+/**
+ * The effective context window for a target: the operator's override, else the registry's number.
+ *
+ * Upstream: pi-blackhole `src/om/model-budget.ts:15-41` (`effectiveContextWindow`), read at commit
+ * 2bf8cda11585c21fef2e5c2d9210690d82a2f2ca. MIT, Copyright (c) 2026 the pi-blackhole authors.
+ * Upstream's resolution ORDER is the mechanism taken: a per-model config override wins, then the
+ * registry value. Upstream's third step -- a hardcoded 128 000 fallback -- is deliberately NOT taken:
+ * a registry entry reporting no window is precisely the case where a made-up number would let this
+ * package route a prompt it has no evidence fits, and a skip with a stated reason is the better
+ * outcome. So `0` here means "unknown", and the caller treats unknown as does-not-fit.
+ */
+export function effectiveContextWindow(target: Pick<ModelTarget, "contextWindow">, model: { contextWindow?: number }): number {
+  if (target.contextWindow !== undefined && target.contextWindow > 0) return target.contextWindow;
+  if (typeof model.contextWindow === "number" && model.contextWindow > 0) return model.contextWindow;
+  return 0;
+}
+
+/**
+ * The part of pi's `Model` this selector reads. Structural, so a table test needs no real registry --
+ * and narrow, so the file cannot quietly start depending on more of the registry than fit and price.
+ */
+export interface FitModel {
+  contextWindow?: number;
+  maxTokens?: number;
+  cost?: { input: number; output: number };
+}
+
+/**
+ * Everything the selector needs to know about one candidate, resolved by the caller.
+ *
+ * `model` is nullish when the reference resolves to no available model. `undefined` is accepted
+ * alongside `null` because `ModelRegistry.find` is typed to return either and a caller should not have
+ * to normalise it to ask this question.
+ */
+export interface FitCandidate<TModel extends FitModel = FitModel> {
+  target: ModelTarget;
+  model: TModel | null | undefined;
+}
+
+/**
+ * One candidate's verdict, in the order the chain will try them.
+ *
+ * Generic over the CANDIDATE, not just its model, so every field the caller attached survives the sort.
+ * The route loop uses that to carry its `malformed` flag through: an unparseable reference and an
+ * unavailable model are different facts that earn different words, and re-deriving the distinction
+ * after ranking would mean re-parsing per hop.
+ */
+export type FitRanking<TCandidate extends FitCandidate = FitCandidate> = TCandidate & {
+  /** The window used for the decision, after the override. `0` = unknown. */
+  window: number;
+  /**
+   * Dollars per million input tokens, the price this ordering is by. `null` when the catalogue reports
+   * no cost -- which sorts LAST rather than first (see below).
+   */
+  inputCost: number | null;
+  fits: boolean;
+  /** Why this candidate does not fit. Present exactly when `fits` is false. */
+  reason?: string;
+}
+
+/**
+ * Order the candidates cheapest-first among those that fit, keeping the operator's order otherwise.
+ *
+ * THE ASK (gap G6, `dive-ours-pi-compaction-router.md` §7.2): "any model it deems fit" is a slot idea
+ * the vision states (A-11); the router only ever took a hand-written ordered list, using
+ * `contextWindow` solely to REJECT and never reading `cost`. This is the smallest honest version of
+ * that: among the targets an operator already authorised, prefer the cheapest one that can actually
+ * hold the prompt.
+ *
+ * WHY IT SITS IN W6 AND NOT EARLIER. Verdict §5.5 and risk 5: fit-aware selection is blocked on G1.
+ * The estimator this ranks against over-counted 3.7x-37.9x and falsely refused 5 of 14 real sessions;
+ * ordering by fit on top of that number would have re-landed the false-skip defect behind a nicer
+ * interface, and cheapest-first would have made it worse by preferring exactly the small-window models
+ * the bad estimate excluded. `estimated` here is W1's `serializeConversation(convertToLlm(...))/4`.
+ *
+ * THE ORDERING RULES, each with its reason:
+ *
+ *  - **Fitting candidates come before non-fitting ones.** A target that cannot hold the prompt is not
+ *    a cheaper option, it is a skip; the chain still carries it, so a later hop can report it.
+ *  - **Among fitting candidates, ascending `cost.input`.** Input dominates a summarization call --
+ *    pi sends the whole conversation and asks for at most `0.8 x reserveTokens` back (13 107 at the
+ *    default reserve against a 268k-token input in the recorded case), so ranking on input price is
+ *    ranking on the bill. Output price is deliberately not blended in: any weighting between the two
+ *    would be a made-up constant, and neatcontext's rule is that an uncalibrated threshold must be
+ *    labelled -- so this avoids inventing one rather than labelling it.
+ *  - **An unpriced model sorts last among those that fit, never first.** A missing price is not a
+ *    price of zero. Sorting `null` first would make a catalogue gap look like the cheapest model in
+ *    the fleet and route every compaction to it.
+ *  - **Ties keep the operator's order.** `Array.prototype.sort` is stable in every runtime this
+ *    package supports, so equal prices leave the configured chain as written -- the operator's
+ *    sequencing is information, and reordering it on a tie would discard it for nothing.
+ *
+ * This function is PURE and returns a ranking rather than mutating a chain, which is what lets a
+ * table test reach every rule without a host, a transcript or a provider.
+ */
+export function rankByFit<TCandidate extends FitCandidate>(
+  candidates: TCandidate[],
+  estimated: number,
+  reserveTokens: number,
+): FitRanking<TCandidate>[] {
+  const ranked = candidates.map((candidate): FitRanking<TCandidate> => {
+    const { target, model } = candidate;
+    // An unresolvable reference is NOT given a fit reason: `fits: false` with no `reason` is how this
+    // says "not my call". The route loop reports an unavailable model in its own words and records it
+    // against provider health as `unavailable`, which is a different fact from `too-small`, and a
+    // reason invented here would pre-empt that distinction.
+    if (!model) return { ...candidate, window: 0, inputCost: null, fits: false };
+    const window = effectiveContextWindow(target, model);
+    const inputCost = typeof model.cost?.input === "number" ? model.cost.input : null;
+    if (window <= 0) {
+      return { ...candidate, window, inputCost, fits: false, reason: `'${target.model}' reports no context window, so nothing can be proven to fit it; set contextWindow on the target to override` };
+    }
+    if (estimated + reserveTokens > window) {
+      return { ...candidate, window, inputCost, fits: false, reason: `'${target.model}' has a ${window}-token window, under the conservative ${estimated}-token input estimate plus ${reserveTokens} reserved tokens` };
+    }
+    return { ...candidate, window, inputCost, fits: true };
+  });
+  // Stable sort: fitting first, then ascending input price with unpriced last, then configured order.
+  return ranked
+    .map((ranking, index) => ({ ranking, index }))
+    .sort((a, b) => {
+      if (a.ranking.fits !== b.ranking.fits) return a.ranking.fits ? -1 : 1;
+      if (!a.ranking.fits) return a.index - b.index;
+      const ac = a.ranking.inputCost, bc = b.ranking.inputCost;
+      if (ac === null && bc === null) return a.index - b.index;
+      if (ac === null) return 1;
+      if (bc === null) return -1;
+      if (ac !== bc) return ac - bc;
+      return a.index - b.index;
+    })
+    .map(entry => entry.ranking);
+}
+
 // ── Route shadowing (dive-ours §5.4) ────────────────────────────────────────────────────────────
 
 export interface ShadowWarning {
