@@ -329,7 +329,7 @@ function asFact(v: unknown): Fact | null {
  * Keying on id+content keeps the intended de-duplication (the same fact observed in two batches hashes
  * and reads identically) while letting a genuine collision survive as two facts.
  */
-const dedupeKey = (fact: Fact): string => `${fact.id} ${fact.content}`;
+const dedupeKey = (fact: Fact): string => `${fact.id}\x00${fact.content}`;
 
 /** Every fact in every batch, in ledger order, de-duplicated but with collisions preserved. */
 function collectFacts(entries: readonly LedgerEntry[]): { facts: Fact[]; coversUpToId?: string } {
