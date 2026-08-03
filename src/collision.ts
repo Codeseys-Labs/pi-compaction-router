@@ -2,7 +2,7 @@
  * HOOK-COLLISION DETECTION — the one-owner rule, and the case where the rule was already broken.
  *
  * Upstream: https://github.com/cortexkit/magic-context, read at commit
- * 7d2230612a22d28f01c38d88e2578cb0c0ffaf2c (MIT, Copyright (c) 2026 cortexkit). Two things are taken,
+ * 7d2230612a22d28f01c38d88e2578cb0c0ffaf2c (MIT, Copyright (c) 2025 ualtinok). Two things are taken,
  * and neither is a line of its code.
  *
  *  1. `packages/pi-plugin/src/fail-closed-pi.test.ts`'s `createFakePi()` shape: a fake `pi` whose

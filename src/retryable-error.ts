@@ -1,9 +1,9 @@
 /**
  * Retryable-error and stale-context detection.
  *
- * Upstream: https://github.com/JMHSV/pi-blackhole, `src/om/retryable-error.ts` (`RETRYABLE_ERROR_RE`,
+ * Upstream: https://github.com/k0valik/pi-blackhole, `src/om/retryable-error.ts` (`RETRYABLE_ERROR_RE`,
  * `isRetryableError`, `isStaleExtensionContextError`), read at commit
- * 2bf8cda11585c21fef2e5c2d9210690d82a2f2ca. MIT, Copyright (c) 2026 the pi-blackhole authors.
+ * 2bf8cda11585c21fef2e5c2d9210690d82a2f2ca. MIT, Copyright (c) 2026 k0valik.
  *
  * Taken as its own module because upstream keeps it as its own module, for a reason it records in
  * its own header: the regex had been copied into two call sites and the copies diverged. The same

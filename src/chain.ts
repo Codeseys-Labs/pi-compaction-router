@@ -1,10 +1,10 @@
 /**
  * Failure-reason-gated route-chain advance.
  *
- * Upstream: https://github.com/cortexkit/pi-magic-context, `packages/pi-plugin/src/subagent-runner.ts`
+ * Upstream: https://github.com/cortexkit/magic-context, `packages/pi-plugin/src/subagent-runner.ts`
  * `isFallbackEligible` -- advance to the next model only on
  * `model_failed | truncated | non_zero_exit | no_assistant`, and stop the chain on anything else. Read
- * at commit 7d2230612a22d28f01c38d88e2578cb0c0ffaf2c. MIT, Copyright (c) 2026 cortexkit.
+ * at commit 7d2230612a22d28f01c38d88e2578cb0c0ffaf2c. MIT, Copyright (c) 2025 ualtinok.
  *
  * WHY. This package advanced the chain on EVERY thrown error. A bad `customInstructions`, a
  * non-retryable 400, a malformed request -- each one burned the whole route list, one target at a

@@ -417,8 +417,8 @@ The native compaction integration and restoration of prior file-operation detail
 Also adapted, all MIT licensed, each read at a named commit rather than a published tarball, each with a per-file provenance header naming the upstream file and what diverges:
 
 - [algal/pi-openai-server-compaction](https://github.com/algal/pi-openai-server-compaction) PR #7 — the durable post-compaction warning, and the retry classifier, `retry-after` handling, 60-second ceiling and abort-inside-the-sleep in `src/retry.ts`.
-- [JMHSV/pi-blackhole](https://github.com/JMHSV/pi-blackhole) — persisted per-model cooldowns and the retryable/stale-context predicates.
-- [cortexkit/pi-magic-context](https://github.com/cortexkit/pi-magic-context) — the failure-class allow-list that gates advancing a fallback chain.
+- [k0valik/pi-blackhole](https://github.com/k0valik/pi-blackhole) — persisted per-model cooldowns and the retryable/stale-context predicates.
+- [cortexkit/magic-context](https://github.com/cortexkit/magic-context) — the failure-class allow-list that gates advancing a fallback chain.
 - [XTSoftwareLabs/neatcontext-plugins](https://github.com/XTSoftwareLabs/neatcontext-plugins) — the suppressor taxonomy, so declining to route says why.
 - [a-Fig/Accordion](https://github.com/a-Fig/Accordion) — the ledger's closed outcome taxonomy, and the "user messages are sacred" and `## Relevant files` prompt conventions.
 - [cortexkit/aft](https://github.com/cortexkit/aft) — the tokenize-cost cap, the honest skip flag, and the savings telemetry.
