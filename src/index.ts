@@ -1,12 +1,17 @@
-import { compact, convertToLlm, getAgentDir, serializeConversation, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionCompactEvent } from "@earendil-works/pi-coding-agent";
+import { compact, convertToLlm, getAgentDir, getSettingsListTheme, getSelectListTheme, serializeConversation, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionCompactEvent } from "@earendil-works/pi-coding-agent";
+import type { SettingItem } from "@earendil-works/pi-tui";
 import { advancesChain, chainExhausted, chainHalt, type ChainStop } from "./chain.js";
-import { configToSettingsValue, cooldownHoursFor, loadConfig, loadRetryPolicy, parseModelReference, parseSessionOverride, type CompactionReason, type ModelTarget, type RouterConfig } from "./config.js";
+import { configToSettingsValue, cooldownHoursFor, loadConfig, loadRetryPolicy, parseModelReference, parseSessionOverride, REASONS, type CompactionReason, type ModelTarget, type RouterConfig } from "./config.js";
 import { CooldownStore } from "./cooldown.js";
 import { ACTIVE_MODEL_TARGET, appendRow, clearRouteRecord, estimateSummaryTokens, formatSavingsRows, readSavings, setRouteRecord, takeRouteRecord, type LedgerRow, type RouteRecord, type ServingTarget } from "./ledger.js";
+import { validateReference, type PickableRegistry } from "./model-picker.js";
 import { clearPendingWarning, setPendingWarning, takePendingWarning } from "./pending-warning.js";
 import { formatHealthRows, ProviderHealth } from "./provider-health.js";
 import { classifyFailure, withTargetRetry, type Classification } from "./retry.js";
 import { checkMaxTokens, findRouteShadowing, selectTargets, type Suppressor } from "./selection.js";
+import { ADVANCED_ROW, RESUME_ROW, RESUME_VALUES, RouterDraft } from "./settings-draft.js";
+import { readSnapshot, SETTINGS_KEY, SettingsWriteError, writeSection, type SettingsScope } from "./settings-store.js";
+import { buildSettingsDialog, ProviderModelPicker } from "./settings-ui.js";
 
 /** Pi's `CompactionPreparation`, reached through the event that carries it rather than re-declared. */
 type Preparation = SessionBeforeCompactEvent["preparation"];
@@ -17,6 +22,22 @@ const warn = (message: string, error?: unknown) => error === undefined ? console
 
 /** Key for the durable not-routed banner. One key, so re-setting it replaces rather than stacks. */
 const NOT_ROUTED_WIDGET_KEY = `${TAG}:not-routed`;
+
+/** The rows whose drill-down produces a model reference, and so whose picks need validating. */
+const REASON_ROWS = REASONS;
+
+/**
+ * Whether the project scope already owns a `compactionRouter` key.
+ *
+ * This decides which scope the dialog edits, and it is deliberately conservative: the UI writes
+ * project settings ONLY when the operator has already put router configuration there AND pi reports
+ * the project trusted. Otherwise it writes global. The alternative -- offering a scope picker --
+ * invites an operator to create project-scoped configuration by accident, in a file that travels with
+ * the repository to everyone who clones it.
+ */
+function projectSectionPresent(ctx: Pick<ExtensionContext, "cwd">): boolean {
+  return readSnapshot("project", ctx.cwd).value[SETTINGS_KEY] !== undefined;
+}
 
 function restorePreviousFileOperations(preparation: { fileOps: { read: Set<string>; edited: Set<string> } }, branchEntries: Array<{ type: string; details?: unknown }>): void {
   const previous = [...branchEntries].reverse().find(entry => entry.type === "compaction");
@@ -423,8 +444,32 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     },
   });
 
+  /**
+   * The raw-JSON editor this command used to BE, demoted to an escape hatch.
+   *
+   * It is still the only way to author things the row surface cannot express -- a multi-target
+   * fallback chain, a per-target `thinkingLevel` or `cooldownHours`, a glob route narrower than the
+   * catch-all -- so it is kept whole, including `parseSessionOverride`'s all-or-nothing semantics
+   * (verdict §4.4). What changed is that it is no longer the front door: it is reached from the
+   * `advanced` row, or by typing an argument to the command.
+   *
+   * Session-scoped, as it always was, and now labelled as such where the operator can read it: the
+   * row surface writes durable settings, this writes an override that dies with the session.
+   */
+  const editSessionOverrideJson = async (ctx: Parameters<typeof loadConfig>[0] & { ui: ExtensionContext["ui"] }, sessionId: string, prefill?: string): Promise<void> => {
+    const source = prefill ?? await ctx.ui.editor(
+      "Compaction router — session override JSON (this session only)",
+      JSON.stringify(configToSettingsValue(configFor(ctx)), null, 2),
+    ) ?? "";
+    if (!source) { ctx.ui.notify("Compaction router configuration unchanged.", "info"); return; }
+    const result = parseSessionOverride(source);
+    if (!result.ok) { ctx.ui.notify(result.error, "error"); return; }
+    sessionOverrides.set(sessionId, result.config);
+    ctx.ui.notify(result.config ? "Session compaction-router override applied immediately." : "Compaction router disabled for this session.", "info");
+  };
+
   pi.registerCommand("compaction-router-config", {
-    description: "Edit a session-local compaction-router override",
+    description: "Configure compaction-router routing (interactive)",
     handler: async (args, ctx) => {
       const sessionId = ctx.sessionManager.getSessionId();
       const input = args.trim();
@@ -433,20 +478,112 @@ export default function compactionRouter(pi: ExtensionAPI): void {
         ctx.ui.notify("Compaction router reset to global/project settings for this session.", "info");
         return;
       }
-      let source = input;
-      if (input === "off") source = "false";
-      if (!source) {
-        const current = configFor(ctx);
-        source = await ctx.ui.editor(
-          "Compaction router — session override JSON",
-          JSON.stringify(configToSettingsValue(current), null, 2),
-        ) ?? "";
-        if (!source) { ctx.ui.notify("Compaction router configuration unchanged.", "info"); return; }
+      // An explicit argument is a power-user instruction and keeps its old, direct meaning: `off`
+      // disables for the session, anything else is parsed as override JSON. Neither needs a TUI, so
+      // both are handled before the mode gate below -- an RPC host keeps the surface it had.
+      if (input) { await editSessionOverrideJson(ctx, sessionId, input === "off" ? "false" : input); return; }
+
+      // `ctx.mode === "tui"`, not `ctx.hasUI`. `hasUI` is also true in RPC mode, where `custom()` has
+      // no terminal to draw on and `getSettingsListTheme()` throws. This is the documented guard
+      // (`docs/extensions.md:944-946`) and `questionnaire.ts:90-92` returns an error result the same way.
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("/compaction-router-config needs the interactive TUI. Pass override JSON as an argument, or 'off', or 'reset'.", "error");
+        return;
       }
-      const result = parseSessionOverride(source);
-      if (!result.ok) { ctx.ui.notify(result.error, "error"); return; }
-      sessionOverrides.set(sessionId, result.config);
-      ctx.ui.notify(result.config ? "Session compaction-router override applied immediately." : "Compaction router disabled for this session.", "info");
+
+      // Read the scope we will write, and remember the fingerprint of the bytes we based the draft on.
+      // Project scope only when pi says the project is trusted -- an untrusted project directory is
+      // somebody else's repository and its settings file is executable configuration.
+      const scope: SettingsScope = ctx.isProjectTrusted() && projectSectionPresent(ctx) ? "project" : "global";
+      const snapshot = readSnapshot(scope, ctx.cwd);
+      const active = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown/unknown";
+      const draft = RouterDraft.from(snapshot.value, SETTINGS_KEY, active);
+      const registry = ctx.modelRegistry as unknown as PickableRegistry;
+
+      let wantsJsonEditor = false;
+      await ctx.ui.custom<void>((tui, _theme, _kb, done) => {
+        // Inside the callback, and only here: `getSettingsListTheme()` throws outside a live TUI.
+        const settingsTheme = getSettingsListTheme();
+        const selectTheme = getSelectListTheme();
+        const requestRender = () => tui.requestRender();
+        const items: SettingItem[] = draft.rows().map(row => ({
+          id: row.id,
+          label: row.label,
+          description: row.description,
+          currentValue: row.currentValue,
+          ...(row.isReasonSlot
+            // The drill-down. `SettingsList` delegates everything to what this returns until it calls
+            // `done`, and on a defined value sets the row and fires `onChange` for us.
+            ? { submenu: (_current: string, finish: (value?: string) => void) => new ProviderModelPicker(registry, selectTheme, finish, requestRender) }
+            : { values: [...RESUME_VALUES] }),
+        }));
+        items.push({
+          id: ADVANCED_ROW,
+          label: "advanced",
+          description: "Edit the raw JSON for this session: multi-target chains, thinking levels, per-target cooldowns, glob routes.",
+          currentValue: "open editor",
+          values: ["open editor"],
+        });
+        return buildSettingsDialog({
+          items,
+          settingsTheme,
+          title: `Compaction router — ${scope} settings · active model ${active}`,
+          onChange: (id, value) => {
+            if (id === ADVANCED_ROW) {
+              // The editor is a `ctx.ui.editor` await, which cannot run while `custom()` owns the
+              // screen. Close first, then open it -- the flag is read after `custom()` resolves.
+              wantsJsonEditor = true;
+              done(undefined);
+              return;
+            }
+            draft.apply(id, value);
+          },
+          onClose: () => done(undefined),
+          requestRender,
+        });
+      });
+
+      if (wantsJsonEditor) { await editSessionOverrideJson(ctx, sessionId); return; }
+      if (!draft.changed()) { ctx.ui.notify("Compaction router configuration unchanged.", "info"); return; }
+
+      // Validate every pick against the SAME registry the compaction hook will call, so a reference
+      // that passes here is one `session_before_compact` can resolve later. A failure writes nothing:
+      // a settings file is not the place to discover a typo.
+      const invalid: string[] = [];
+      for (const reason of REASON_ROWS) {
+        const pick = draft.pickFor(reason);
+        if (!pick) continue;
+        const check = validateReference(registry, pick);
+        if (!check.ok && check.error) invalid.push(check.error);
+      }
+      if (invalid.length) { ctx.ui.notify(`Nothing was written. ${invalid.join(" ")}`, "error"); return; }
+
+      try {
+        const written = writeSection({
+          scope,
+          cwd: ctx.cwd,
+          baseHash: snapshot.baseHash,
+          section: draft.toSettingsValue(),
+          projectTrusted: ctx.isProjectTrusted(),
+        });
+        // The session mirror. `appendEntry` is replay-safe and travels with the session tree, so a
+        // resumed or forked session can see what this dialog did without re-reading settings -- and,
+        // unlike a settings write, it is a record of WHEN as well as what.
+        pi.appendEntry("compaction-router-config", { scope, path: written.path, section: draft.toSettingsValue() });
+        // A durable write must not silently disagree with routing. `verifyEffective` re-parses what we
+        // just wrote through `resolveConfig` + `selectTargets` and reports any slot a hand-written
+        // route still out-ranks -- the one way a surgical write can succeed and mean nothing.
+        const problems = draft.verifyEffective(SETTINGS_KEY);
+        const summary = `Compaction router ${scope} settings updated (${written.path}).`;
+        if (problems.length) ctx.ui.notify(`${summary} But: ${problems.join(" ")}`, "warning");
+        else ctx.ui.notify(`${summary} New compactions use it immediately.`, "info");
+      } catch (error) {
+        // A conflict or a held lock is an expected outcome, not a crash: report it in the operator's
+        // language and leave the file alone. `configFor` re-reads settings per compaction, so there is
+        // no stale in-memory state to unwind.
+        const message = error instanceof SettingsWriteError ? error.message : `Could not write settings: ${error instanceof Error ? error.message : String(error)}`;
+        ctx.ui.notify(message, "error");
+      }
     },
   });
 
@@ -473,6 +610,10 @@ export * from "./cooldown.js";
 export * from "./ledger.js";
 export * from "./pending-warning.js";
 export * from "./provider-health.js";
+export * from "./model-picker.js";
 export * from "./retry.js";
 export * from "./retryable-error.js";
 export * from "./selection.js";
+export * from "./settings-draft.js";
+export * from "./settings-store.js";
+export * from "./settings-ui.js";

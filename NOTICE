@@ -124,3 +124,42 @@ plugins/claude-code/neatcontext/src/core/save-nudge.mjs: a decision returned as
 says why and is testable without a host. The suppressor names are this project's own. Its
 practice of labelling an uncalibrated threshold as a guess is followed for
 MAX_TOKENS_REFUSAL_FRACTION.
+
+src/settings-store.ts adapts the durable-write shape from that project's
+plugins/pi/neatcontext/src/core/lite-context.mjs, read at the same commit: fingerprintLite's
+optimistic-concurrency token, requireCurrentBase, the mkdir-atomic acquireUpdateLock with its
+staleness sweep, replaceLiteDirectory, and -- the load-bearing detail -- updateCapturedLite's
+sequence of checking the base fingerprint TWICE, once at prepare and again inside the lock,
+for the reason upstream's own comment gives: other writers respect the lock, but an operator
+editing the file by hand does not. Upstream fingerprints a whole context directory and renames
+directories with a backup and rollback; ours is one settings file, so the fingerprint is a
+sha256 of its bytes and the atomic commit is a staging-file rename. Upstream's revision counter
+is not taken (pi owns this file's shape). Upstream's 60-second lock staleness threshold is
+deliberately NOT kept: ours is 10 seconds to match proper-lockfile's default, because pi
+acquires this same lock path through that library and the two holders must agree on when a
+lock is dead. Not taken: normalizeCaptureKnowledge's model-authored-path allowlist, which has
+no analogue here.
+
+This project also adapts two patterns from Pi's own published reference material:
+https://github.com/earendil-works/pi (packages/coding-agent)
+Copyright (c) 2026 Mario Zechner. Declared "license": "MIT" in the package.json of
+@earendil-works/pi-coding-agent; that manifest field is the whole basis for this attribution,
+as the published package ships no LICENSE file of its own (checked in the installed tree).
+Read in the installed @earendil-works/pi-coding-agent 0.81.1 tree that this package pins --
+which for this upstream is the same artifact the peer dependency already requires, not a
+vendored copy.
+
+  - The SettingsList host in src/settings-ui.ts follows examples/extensions/tools.ts:66-135 --
+    the ctx.mode !== "tui" guard, ctx.ui.custom(), getSettingsListTheme() called inside the
+    callback rather than at module scope, and the returned {render, invalidate, handleInput}
+    that forwards to the list and requests a render. That examples directory is published as
+    copy-me reference material and docs/tui.md:612-670 says so explicitly ("Copy these patterns
+    instead of building from scratch").
+  - The model filter in src/settings-ui.ts and src/model-picker.ts reproduces
+    ModelSelectorComponent's arm (dist/modes/interactive/components/model-selector.js:2,
+    195-198) -- an Input plus fuzzyFilter over a rebuilt SelectList -- together with
+    getModelSelectorSearchText's provider-first search text
+    (dist/modes/interactive/model-search.js), whose token ORDER is the point and is preserved
+    verbatim. Neither is exported from the package root, so the ~15 lines are reproduced rather
+    than imported. ModelSelectorComponent itself is deliberately NOT reused: it is arity-8 and
+    demands a ModelRuntime, which is precisely what ExtensionContext does not expose.

@@ -100,11 +100,18 @@ describe("provider health is passive: no probe is ever made", () => {
         await host.emit(name, events[name]);
         driven.push(name);
       }
+      // `compaction-router-config` is now IN the sweep. It used to be excluded for needing a ctx method
+      // the harness did not model, and W4 both made that false (the harness models `ui.custom` and
+      // `ui.editor`) and made the exclusion expensive: the settings dialog reads `getAvailable()` and
+      // calls `find()` to validate, so it is now the surface most likely to acquire a probe by accident.
+      // It is driven here with the operator escaping straight out -- the minimum interaction, which is
+      // exactly the case where any provider contact would be unprovoked.
+      //
+      // `compact-resume` stays out: it calls `ctx.compact`, pi's own compaction entry point, which the
+      // harness does not model and which is not the registry. It is driven where it is meaningful.
+      host.ui.driveCustom = component => component.handleInput?.("\x1b");
       for (const name of host.commandNames()) {
-        // `compact-resume` and `compaction-router-config` both need a ctx method the harness does not
-        // model; they are driven where they are meaningful. Skipping them here is safe because
-        // neither can reach a provider without going through the counted registry.
-        if (name !== "compaction-router") continue;
+        if (name === "compact-resume") continue;
         await host.runCommand(name);
         driven.push(name);
       }
@@ -113,6 +120,7 @@ describe("provider health is passive: no probe is ever made", () => {
       expect(driven).toContain("session_compact");
       expect(driven).toContain("session_shutdown");
       expect(driven).toContain("compaction-router");
+      expect(driven).toContain("compaction-router-config");
     });
     expect(counts).toEqual({ find: 0, auth: 0, compact: 0 });
   });
