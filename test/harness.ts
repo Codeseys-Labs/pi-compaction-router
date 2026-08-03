@@ -92,8 +92,20 @@ export interface HostOptions {
 export interface Host {
   emit(event: string, event_: unknown): Promise<unknown>;
   hasHandler(name: string): boolean;
+  /** Every event name the extension registered a handler for. */
+  handlerNames(): string[];
+  /** Every slash command the extension registered. */
+  commandNames(): string[];
+  /** Drive a registered slash command against the same ctx the handlers get. */
+  runCommand(name: string, args?: string): Promise<unknown>;
   readonly ui: FakeInteractiveUI;
   readonly ctx: Record<string, unknown>;
+  /**
+   * The throwaway agent dir this host redirected `PI_CODING_AGENT_DIR` to -- where `getAgentDir()`
+   * resolves, and so where the ledger is written. Exposed so a test can read the artifact the code
+   * actually produced instead of being told a path. NEVER `~/.pi`.
+   */
+  readonly agentDir: string;
 }
 
 /**
@@ -106,13 +118,15 @@ export async function withHost<T>(
   loader: () => Promise<{ default: unknown }> = () => import("../src/index.js"),
 ): Promise<T> {
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = agentDirWith({ ...options.hostSettings, compactionRouter: options.routerConfig });
+  const agentDir = agentDirWith({ ...options.hostSettings, compactionRouter: options.routerConfig });
+  process.env.PI_CODING_AGENT_DIR = agentDir;
   try {
     const mod = await loader();
     const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
     (mod.default as (pi: unknown) => void)({
       on: (name: string, fn: (event: unknown, ctx: unknown) => unknown) => handlers.set(name, fn),
-      registerCommand: () => {},
+      registerCommand: (name: string, spec: { handler: (args: string, ctx: unknown) => unknown }) => commands.set(name, spec.handler),
       addCommand: () => {},
       addTool: () => {},
       sendMessage: () => {},
@@ -138,8 +152,16 @@ export async function withHost<T>(
         return await handler(event_, ctx);
       },
       hasHandler: name => handlers.has(name),
+      handlerNames: () => [...handlers.keys()],
+      commandNames: () => [...commands.keys()],
+      runCommand: async (name, args = "") => {
+        const handler = commands.get(name);
+        if (!handler) throw new Error(`no command registered as '${name}'`);
+        return await handler(args, ctx);
+      },
       ui,
       ctx,
+      agentDir,
     };
     return await body(host);
   } finally {
@@ -161,11 +183,31 @@ export function beforeCompactEvent(options: PreparationOptions & { reason?: stri
   };
 }
 
-/** A `session_compact` event for the compaction pi has just committed. */
-export function compactEvent(options: { fromExtension?: boolean; reason?: string; willRetry?: boolean } = {}): Record<string, unknown> {
+/**
+ * A `session_compact` event for the compaction pi has just committed.
+ *
+ * `summary`, `tokensBefore` and `usage` are overridable because the ledger reads all three off the
+ * committed entry -- a fixed `tokensBefore: 1` cannot exercise a savings meter.
+ */
+export function compactEvent(options: {
+  fromExtension?: boolean;
+  reason?: string;
+  willRetry?: boolean;
+  summary?: string;
+  tokensBefore?: number;
+  usage?: unknown;
+} = {}): Record<string, unknown> {
   return {
     type: "session_compact",
-    compactionEntry: { type: "compaction", id: "entry-compaction", summary: "a summary", firstKeptEntryId: "entry-first-kept", tokensBefore: 1, fromHook: options.fromExtension ?? false },
+    compactionEntry: {
+      type: "compaction",
+      id: "entry-compaction",
+      summary: options.summary ?? "a summary",
+      firstKeptEntryId: "entry-first-kept",
+      tokensBefore: options.tokensBefore ?? 1,
+      fromHook: options.fromExtension ?? false,
+      ...(options.usage === undefined ? {} : { usage: options.usage }),
+    },
     fromExtension: options.fromExtension ?? false,
     reason: options.reason ?? "manual",
     willRetry: options.willRetry ?? false,
