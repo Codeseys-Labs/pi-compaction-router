@@ -32,6 +32,7 @@ type Handler = (...args: unknown[]) => unknown;
  */
 function createFakePi() {
   const handlers = new Map<string, Handler[]>();
+  const tools: string[] = [];
   return {
     pi: {
       on(event: string, handler: Handler) {
@@ -40,12 +41,18 @@ function createFakePi() {
         handlers.set(event, list);
       },
       registerCommand: () => {},
+      // `registerTool` is pi's real name for this (`loader.js:195`) and W5's `recall-fact` calls it.
+      // `addTool` below is NOT a method on pi's ExtensionAPI at all -- it was a no-op under a name pi
+      // does not have, which is worse than no stub: the first real `registerTool` call turned this whole
+      // fixture into a `TypeError` about a missing function rather than an answer about hook ownership.
+      registerTool: (spec: { name: string }) => { tools.push(spec.name); },
       addCommand: () => {},
-      addTool: () => {},
       sendMessage: () => {},
       appendEntry: () => {},
     },
     handlers,
+    /** Every tool name registered, so the fixture can speak to tool-name collisions too. */
+    tools,
     /** Handler counts per event, the shape `assertSingleCompactionOwner` reads. */
     counts: () => new Map([...handlers].map(([event, list]) => [event, list.length])),
   };
@@ -69,6 +76,25 @@ describe("the reviewed profile has exactly one session_before_compact owner", ()
     await loadInto(host);
     expect(host.handlers.get(COMPACTION_HOOK)?.length).toBe(1);
     expect(assertSingleCompactionOwner(host.counts())).toBeNull();
+  });
+
+  test("the tool this package registers is namespaced, so it cannot lose a first-registration race", async () => {
+    // The same collision hazard one layer down, and it arrived with W5's `recall-fact`. Tool names are
+    // FIRST-registration-wins across extensions (`runner.js:278-282`), which is the opposite resolution
+    // from `session_before_compact`'s last-writer-wins -- and the more dangerous one here, because a
+    // co-installed memory package claiming a bare `recall` first would silently serve ITS tool under a
+    // name this package's own fold taught the model to call. pi-observational-memory does claim exactly
+    // that name (`tools/recall-observation.ts:16`), and `dive-pi-observational-memory.md` §6 flags it as
+    // generic enough to want checking against `pi-memory-layers`' `memory` tool as well.
+    const host = createFakePi();
+    await loadInto(host);
+    expect(host.tools).toContain("recall-fact");
+    for (const generic of ["recall", "memory", "remember", "search"]) {
+      expect(host.tools).not.toContain(generic);
+    }
+    // And every tool name is prefixed, so a future addition inherits the property rather than
+    // re-deciding it.
+    for (const name of host.tools) expect(name).toMatch(/-fact$|^compaction-router/);
   });
 
   test("a SECOND owner loaded beside us is REFUSED, not silently tolerated", async () => {

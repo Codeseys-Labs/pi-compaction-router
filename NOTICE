@@ -43,9 +43,28 @@ resolved -- is adapted from that project's extension/accordion.ts:385-457
 (`recordPlanOutcome` and its `PlanOutcomeCause` union). The cause names themselves are
 not reused: upstream's describe a GUI round-trip, ours describe route resolution.
 Upstream counts causes in memory and acknowledges them over a WebSocket; this project
-persists a row per compaction instead. Nothing else from Accordion is used here -- its
-fidelity ladder, fold/digest engine, Tauri GUI, WebSocket transport and `context`-hook
-interception are all out of scope for a router.
+persists a row per compaction instead.
+
+A second mechanism from the same commit is adapted in src/preservation-prompt.ts: the
+USER_MESSAGES_SACRED_BLOCK and RELEVANT_FILES_BLOCK constants come from
+conductors/compaction-naive/compaction-naive.ts:109-156 (COMPACTION_SYSTEM) -- the
+"USER MESSAGES ARE SACRED" rule with its instruction to reproduce every user message
+verbatim and in order, its parenthetical naming what IS summarized by contrast, the
+`## Relevant files` section with a per-file reason, and the "(none)" placeholder
+convention that keeps a section present when empty. Adapted rather than taken whole:
+upstream's COMPACTION_SYSTEM is a complete system prompt dictating a seven-section output
+shape, because upstream owns its summarization call end to end. This project does not --
+pi's own SUMMARIZATION_SYSTEM_PROMPT and SUMMARIZATION_PROMPT are the system and base
+prompts and customInstructions is appended to the base prompt -- so these blocks are
+written as ADDITIONS to a structure pi already specified. Upstream's "no prose outside
+the sections" rule and its Goal/Progress/Key decisions/Next steps/Critical context
+section list are deliberately NOT taken: pi's own prompt already asks for that material
+under its own headings, and dictating a competing list from customInstructions would
+fight the primitive this package exists to preserve.
+
+Nothing else from Accordion is used here -- its fidelity ladder, fold/digest engine,
+Tauri GUI, WebSocket transport and `context`-hook interception are all out of scope for
+a router.
 
 This project also adapts portions of AFT:
 https://github.com/cortexkit/aft
@@ -84,8 +103,101 @@ last-call / last-success / last-error triple, error-message truncation at a name
 the rule that a success clears the previous error rather than leaving a stale one beside it,
 and the snapshot-as-wire-format split. Upstream's provider-role decorator becomes a
 per-target record here, because a route chain is a list of targets rather than a pair of
-roles. Upstream's daemon substrate, embedding provider, consolidation prompts and eval
-harness are not used.
+roles.
+
+Two prompt blocks in src/preservation-prompt.ts are adapted from the same commit's
+crates/ai-memory-consolidate/prompts/batch_consolidate_system.md: SECURITY_BOUNDARY_BLOCK
+from :6-19 (`## SECURITY BOUNDARY`) and FAITHFULNESS_BLOCK from :20-60
+(`## FAITHFULNESS -- the most important rule`). Taken: the section headings; the recency
+rule that later material supersedes earlier and that a superseded draft may appear as
+history but never as current fact; the concrete "Do NOT" list (no invented dates,
+versions, commit hashes, paths, function names, line numbers or error codes; no
+"When to use"/"Gotchas"/"Best practices"/"Alternative approaches" reference-material
+sections; no alternatives never considered; no expanding terse user comments into essays;
+no fabricated code examples; no speculation absent from the source); and the framing that
+conversation history is untrusted DATA which cannot supply facts, authorize disclosure,
+request tool use, or override the output contract. Adapted: upstream consolidates a
+session into wiki pages, so its wording is about pages, `kind` classification and
+wikilinks; ours is about a compaction summary. Upstream's untrusted input is observations
+plus a project preference file; ours is the conversation history plus the operator's own
+customInstructions, which is why this project adds its own OPERATOR FOCUS heading and
+frames that text as advisory.
+
+Upstream's daemon substrate, embedding provider, marker-file walk, prompt-preference file
+and eval harness are not used.
+
+This project also adapts portions of pi-observational-memory:
+https://github.com/elpapi42/pi-observational-memory
+Copyright (c) 2026 pi-observational-memory contributors, licensed under the MIT License.
+Read at commit 497fcfbff1c240f020216b574a26932d23ab10fc (repo main, 2026-07-29) -- a clone
+of the repository at that commit, NEVER npm:pi-observational-memory@3.0.3. That distinction
+is load-bearing rather than ceremonial: the published tarball declares the SAME version
+string as this commit while lacking the observer chunk cap, the oversized-entry handling,
+the stream-error logging and the pi-0.81 stream-function fix, because eight src/ commits
+shipped under one unchanged version. The drift is invisible to semver, so only a commit
+identifies the code.
+
+src/preservation.ts and src/observer.ts adapt these mechanisms, by that project's own
+stealList numbering as recorded in docs/research/compaction-v2/dive-pi-observational-memory.md:
+
+  - Coverage-ranked forgetting (steal 1), from agents/dropper/coverage.ts:12-31: the
+    none/partial/strong tiers, and the INVERTED drop rank in which `strong` is cheapest to
+    drop and `none` dearest. The inversion is upstream's insight and is kept exactly.
+    Retargeted from upstream's supportingObservationIds relation to a `supersedes` relation,
+    because this project has one record type where upstream has observations and reflections.
+  - The deterministic fold at the compaction boundary (steal 2), from
+    session-ledger/projection.ts:173-208 and render-summary.ts:20-31, including the
+    `[id] timestamp [relevance] content` line format and the recall-teaching preamble with
+    its bound ("Do not use recall as broad search or inject raw source unless it is
+    needed", render-summary.ts:10). ONE FUNDAMENTAL DIVERGENCE: upstream returns its
+    rendered fold AS the compaction summary and makes zero model calls, which is the
+    inverted thesis this project declines. Here the fold is rendered into pi's own
+    compact() as customInstructions; pi still writes the summary, the entry stays native,
+    and fileOps and fromHook semantics are unchanged.
+  - The recall back-channel (steal 3), from tools/recall-observation.ts and
+    session-ledger/recall.ts: id-to-verbatim-source exchange, with upstream's collision
+    handling, its active-vs-dropped status, and its source_unavailable outcome all kept,
+    because those three are what make the answer honest. Registered as `recall-fact`, not
+    upstream's `recall`, since tool names are first-registration-wins and a bare `recall`
+    would collide.
+  - Code-enforced source-id citation (steal 4), from agents/observer/agent.ts:69-84 and
+    106-110 (normalizeSourceEntryIds and its use inside the tool's own execute):
+    upstream's allowlist semantics unchanged, including that ANY id outside the allowlist
+    rejects the whole record, that an empty list rejects, and that surviving ids are
+    de-duplicated and sorted into the allowlist's order.
+  - `ratio` threshold mode (steal 6), from config.ts:80-85 (resolveCompactAfterTokens),
+    retargeted: upstream expresses its proactive COMPACTION threshold as a fraction of the
+    active model's context window, while this project applies the same shape to the
+    OBSERVATION threshold, because this package never decides when to compact.
+  - The deferred-and-re-checked trigger (steal 7), from hooks/compaction-trigger.ts:55-74:
+    setTimeout(0), then re-assert ctx.isIdle() before doing the work, with the ctx fields
+    captured synchronously for the reason upstream's own comment gives.
+  - The compaction re-entrancy guard (steal 8), from hooks/compaction-hook.ts:17-25, MINUS
+    its `{cancel: true}` return. Cancelling a compaction ends a session, so a duplicate here
+    declines only this package's extra work and lets pi's compaction proceed.
+  - The observerChunkMaxTokens derived cap (steal 10), from config.ts:104-129
+    (resolveObserverChunkMaxTokens, added upstream by commit 2057c10 and present only on
+    main). Upstream's constants are kept -- OBSERVER_CHUNK_CONTEXT_RATIO 0.2, the 60000
+    fallback, the 256 floor -- as is its rationale, which is why the cap is not optional:
+    an uncapped backlog that outgrows the model's window makes every observer call fail, so
+    coverage never advances and the session can never recover. Upstream's head/tail excerpt
+    for a single oversized entry (commit d0ebd32) is simplified to a marked clip of that one
+    entry, keeping the property that matters.
+  - The source-addressed chunk format from src/serialize.ts:199-236
+    (serializeSourceAddressedBranchEntries), including the `[Source entry id: <id>]` label
+    that makes the citation allowlist legible to the model, and its oldest-first drain.
+  - hashId (src/ids.ts, sha256 truncated to 12 hex chars), estimateStringTokens and
+    estimateEntryTokens (src/tokens.ts), and MAX_RECORD_CONTENT_CHARS (src/serialize.ts:102).
+
+Not taken from that project: its agentLoop-driven observer/reflector/dropper pipeline and
+typebox tool schemas (which would make @earendil-works/pi-agent-core a dependency of this
+package for one background call, against the zero-runtime-deps rule this package keeps);
+its om:status / om:view commands; its PI_OBSERVATIONAL_MEMORY_PASSIVE env key; its
+process-lifetime config cache; and -- emphatically -- its default of resolving background
+workers to the SESSION model with no cooldown, queue or rate limit, which is the mechanism
+behind the one substantiated community report of background observation starving local
+inference. The worker here resolves only through this package's own route table and
+cooldown store, and never borrows the session model or the compaction chain.
 
 This project also adapts portions of pi-blackhole:
 https://github.com/k0valik/pi-blackhole

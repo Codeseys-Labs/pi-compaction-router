@@ -75,6 +75,78 @@ A failed target is now classified rather than simply abandoned:
 
 Settings are re-read at every compaction, so global or trusted project changes take effect during the current session without `/reload`.
 
+### The preservation layer (off by default)
+
+A routed summary is only as good as what the summarizing model can still see. The preservation layer
+records durable facts *during* the session, with a cheap model, and folds them into the summarization
+prompt so the summary is anchored in facts written while the original messages were still in context.
+
+**It is off unless you switch it on, and switching it on costs money in the background.** A background
+observer that borrows the model your own turns are waiting on is a real failure mode — it is the one
+substantiated complaint about the upstream package this layer takes its mechanisms from — so the
+observer never runs without an explicit `preservation.enabled: true` *and* a worker model of its own.
+
+```json
+{
+  "compactionRouter": {
+    "models": [{ "model": "anthropic/claude-sonnet-4-5", "thinkingLevel": "low" }],
+    "workerModels": [
+      { "model": "openrouter/google/gemma-4-31b-it", "thinkingLevel": "off" }
+    ],
+    "preservation": {
+      "enabled": true,
+      "observeAfterTokens": 10000,
+      "mode": "static",
+      "maxFacts": 200,
+      "injectFold": true
+    }
+  }
+}
+```
+
+- **`enabled` must be the boolean `true`.** `"true"`, `1` and `yes` are rejected with a warning: a
+  layer that spends money in the background should not switch itself on by type coercion.
+- **`workerModels` is a chain, tried in order, and it is never inferred.** With no `workerModels` and
+  no route covering the `worker` slot, nothing is observed — the layer does **not** fall back to your
+  compaction targets or to the session model. Falling back to `models` would bill you for a
+  frontier-model call every observation window; falling back to the session model is the starvation.
+  A route may serve the worker instead by naming the slot: `"reasons": ["worker"]`. Routes written
+  before this feature keep covering exactly the three compaction reasons.
+- Worker targets share the compaction path's **cooldowns and provider health**, so a provider that
+  rate-limited as a worker is known to be down when it is next considered for a compaction, and the
+  chain advances past it without a call. Worker calls are **not** retried: a compaction is worth
+  sleeping 2s for, a background pass the next turn will re-attempt is not.
+- **`observeAfterTokens`** is how much unobserved conversation triggers a pass (default 10 000). With
+  `"mode": "ratio"` and a `"ratio"` between 0 and 1 it becomes a fraction of the *active* model's
+  context window instead, so a 1M-context session is not observed on a 128k model's cadence.
+- **`observerChunkMaxTokens`** caps what one pass sends. Left unset it is a fifth of the *worker's*
+  window (fallback 60 000). The cap is not a nicety: without it a backlog that outgrows the worker's
+  window makes every pass fail, so coverage never advances and the session cannot recover. With it, an
+  oversized backlog drains oldest-first across passes, and one pathological tool result is clipped
+  rather than blocking coverage forever.
+- **`maxFacts`** bounds what the fold carries (default 200). Over that, facts are dropped by
+  *coverage rank*: a fact that later facts have already superseded is the cheapest to drop, because its
+  meaning now lives in them, while a fact nothing has absorbed is the dearest. Dropped facts stay in the
+  session record and stay recallable — lossy in the prompt, lossless on the record. The fold says how
+  many it omitted rather than omitting them silently.
+- **`injectFold: false`** keeps recording facts but stops adding them to the prompt.
+
+Facts are appended as custom session entries, which Pi keeps out of the LLM context, so recording one
+costs nothing until the fold injects it. They travel with the session tree, survive compaction by
+construction, and are re-folded from the entries every time — never re-summarized from the previous
+summary. Each fact must cite the source entry ids it came from, and a fact citing an id that was not in
+the chunk is **discarded in code** before it can be stored, not merely discouraged in the prompt.
+
+The `recall-fact` tool exchanges a fact id for its verbatim source, so the summary can be aggressively
+compressed and still be recovered where precision matters. `/compaction-router` reports the layer's
+state, the worker chain, the resolved threshold and the current fact count.
+
+Pi's compaction primitive is untouched by all of this. The fold is passed to Pi's own `compact()` as
+`customInstructions`; Pi still writes the summary, the compaction entry stays native, and file-operation
+restore and `fromHook` semantics are unchanged. The prompt the routed model receives also carries a
+faithfulness rule (no invented paths, line numbers, commit hashes or speculation), a security boundary
+framing conversation history as untrusted data, and the rule that user messages are reproduced verbatim.
+
 ### Interactive configuration
 
 `/compaction-router-config` with no arguments opens a settings list: one row per compaction reason, plus auto-resume and an advanced row.
@@ -123,9 +195,18 @@ After successful compaction, the extension injects a visible custom continuation
 
 ## Commands
 
-- `/compaction-router` — show active model, configuration source, routes, fallback order, thinking levels, auto-resume policy, and — once anything has been compacted — the savings meter and per-target health.
+- `/compaction-router` — show active model, configuration source, routes, fallback order, thinking levels, auto-resume policy, the preservation layer's state, and — once anything has been compacted — the savings meter and per-target health.
 - `/compaction-router-config` — open the interactive routing settings (TUI only); with `off`, `reset` or JSON, edit the current session's override in any mode.
 - `/compact-resume [instructions]` — compact and explicitly continue.
+
+One tool is registered for the model rather than the operator:
+
+- `recall-fact` — exchange a 12-hex fact id from a summary's recorded-facts section for the verbatim
+  source behind it. Registered whether or not the preservation layer is enabled, because settings change
+  mid-session and gating registration would leave a fold citing ids no tool could resolve until restart;
+  with no facts recorded it simply answers that the id is not found. Named `recall-fact` rather than
+  `recall` deliberately: tool names are first-registration-wins across extensions, and a bare `recall`
+  would collide with a co-installed memory package under a name our own prompt taught the model.
 
 Pi does not expose an extension API for adding fields to the built-in `/settings` menu, so this package owns its own command. It does expose the components that menu is built from, and the interactive surface above uses them; configuration remains plain JSON on disk and reviewable there.
 
@@ -296,6 +377,32 @@ compaction assertion as a broken probe, not evidence about the router.
 - The severe-truncation threshold for the `maxTokens` guard (half of Pi's requested summary budget) is an uncalibrated guess, and is labelled as one in `src/selection.ts`. Nothing has measured where the real line is.
 - Automatic resume does not prove that unfinished work exists; leave it disabled if strict turn control matters.
 
+Limitations specific to the preservation layer, which is why it is off by default:
+
+- **Enabling it means paying for a model call roughly every `observeAfterTokens` of conversation.** The
+  worker is meant to be a cheap small model; pointing it at a frontier model is supported and expensive.
+- **A background pass competes for whatever serves the worker.** Routing it to a different provider than
+  your session model is the point of `workerModels`; pointing both at the same local endpoint recreates
+  the contention this design exists to avoid. The pass is deferred past the turn's end and re-checked
+  before it runs, and only one runs at a time, but it is still real work on a real endpoint.
+- **Facts are model-written and therefore fallible.** Cited source ids are verified in code, so a fact's
+  *provenance* cannot be fabricated, but its *wording* is the worker's summary of that source. `recall-fact`
+  exists because of this: when a fact is load-bearing, read the source it cites rather than trusting the
+  paraphrase.
+- **A fact is only as durable as its branch.** Facts live in the session tree, so a fork inherits what its
+  branch recorded and nothing else, and a fact whose source entries have left the branch recalls as
+  `source_unavailable` rather than silently returning nothing.
+- **Fact content is written to the session file.** The ledger under `$PI_CODING_AGENT_DIR` still records no
+  message content, but recorded facts are conversation-derived text in the session record. If a session
+  file is not somewhere conversation content may live, leave this layer off.
+- The observation threshold and the chunk cap are denominated in the same characters ÷ 4 heuristic as the
+  rest of this package, which undercounts non-ASCII content — upstream's own caveat, and the reason the
+  chunk-cap ratio is a conservative 0.2 of the window rather than something tighter.
+- Coverage-ranked forgetting is a better policy than recency, not a solved problem: it depends on the
+  worker choosing to declare that a new fact supersedes an old one. Facts nothing supersedes are never
+  dropped ahead of ones that were, which is the intended bias, but a worker that never emits `supersedes`
+  degrades the policy to oldest-first within a relevance tier.
+
 ## Development
 
 ```bash
@@ -313,8 +420,9 @@ Also adapted, all MIT licensed, each read at a named commit rather than a publis
 - [JMHSV/pi-blackhole](https://github.com/JMHSV/pi-blackhole) — persisted per-model cooldowns and the retryable/stale-context predicates.
 - [cortexkit/pi-magic-context](https://github.com/cortexkit/pi-magic-context) — the failure-class allow-list that gates advancing a fallback chain.
 - [XTSoftwareLabs/neatcontext-plugins](https://github.com/XTSoftwareLabs/neatcontext-plugins) — the suppressor taxonomy, so declining to route says why.
-- [a-Fig/Accordion](https://github.com/a-Fig/Accordion) — the ledger's closed outcome taxonomy.
+- [a-Fig/Accordion](https://github.com/a-Fig/Accordion) — the ledger's closed outcome taxonomy, and the "user messages are sacred" and `## Relevant files` prompt conventions.
 - [cortexkit/aft](https://github.com/cortexkit/aft) — the tokenize-cost cap, the honest skip flag, and the savings telemetry.
-- [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) — the passive provider-health record.
+- [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) — the passive provider-health record, and the faithfulness and security-boundary prompt blocks.
+- [elpapi42/pi-observational-memory](https://github.com/elpapi42/pi-observational-memory) — the preservation layer's mechanisms: coverage-ranked forgetting, the deterministic fold, the `recall` back-channel, code-enforced source-id citation, `ratio` threshold mode, the deferred-and-re-checked trigger, the re-entrancy guard and the observer chunk cap. Its thesis is *not* adopted: upstream returns its fold as the summary and makes no model call, where this package folds into Pi's own `compact()` and leaves the primitive in charge. Read at a `main` commit rather than its npm 3.0.3, which advertises the same version string while missing four fixes including the chunk cap.
 
 See [`NOTICE`](./NOTICE) and [`LICENSE`](./LICENSE) for the commit SHAs and the precise scope of each adaptation.

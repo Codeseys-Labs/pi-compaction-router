@@ -27,7 +27,7 @@
  * selection an operator cannot otherwise see.
  */
 
-import { globMatch, type CompactionReason, type ModelTarget, type Route, type RouterConfig } from "./config.js";
+import { globMatch, WORKER_SLOT, type CompactionReason, type ModelTarget, type Route, type RouterConfig, type RouteSlot } from "./config.js";
 import type { CooldownEntry } from "./cooldown.js";
 
 /**
@@ -243,6 +243,52 @@ export function rankByFit<TCandidate extends FitCandidate>(
     .map(entry => entry.ranking);
 }
 
+// ── The observer worker's targets (W5) ──────────────────────────────────────────────────────────
+
+/**
+ * The observer worker's target chain, through the SAME table, suppressors and cooldowns as a
+ * compaction — which is the capability POM lacks and the reason this layer belongs here.
+ *
+ * Upstream POM resolves one `observational-memory.model`, memoizes it across all three of its
+ * background stages, and falls back to the SESSION model when it is missing
+ * (`runtime.ts:42-62`, read at `497fcfb`). That last arm is the starvation: the background worker
+ * quietly borrows the model the user's own turn is waiting on. This function has no such arm. If no
+ * worker target resolves, the caller gets an empty `fire` with a suppressor and records nothing --
+ * observation is skipped, never silently promoted onto the session model.
+ *
+ * Precedence: an explicit `workerModels` chain first, then any route that opted into the `worker`
+ * slot, and NEVER `config.defaults`. Falling through to the compaction defaults would point the
+ * observer at the expensive summarization model, which inverts the entire point of a cheap worker --
+ * an operator who configured one compaction target and switched the layer on would be billed for a
+ * frontier-model call every 10 000 tokens without ever asking for one.
+ */
+export function selectWorkerTargets(config: RouterConfig, activeModel: string, options: SelectOptions = {}): TargetSelection {
+  const reasons: string[] = [];
+  let candidates: ModelTarget[] = config.workerModels;
+  if (candidates.length) reasons.push(`using the configured worker models for the observer`);
+  else {
+    const route = config.routes.find(r => r.reasons.includes(WORKER_SLOT) && globMatch(r.match, activeModel));
+    if (route) {
+      candidates = route.models;
+      reasons.push(`route '${route.match}' matched ${activeModel} for the observer worker`);
+    }
+  }
+  if (!candidates.length) {
+    return none("no-targets-configured", `no worker models are configured and no route covers the '${WORKER_SLOT}' slot for ${activeModel}; set compactionRouter.workerModels to run the observer`);
+  }
+  if (!options.cooldownFor) return { fire: candidates, reasons, suppressor: null };
+
+  const fire: ModelTarget[] = [];
+  const cooled: string[] = [];
+  for (const target of candidates) {
+    const entry = options.cooldownFor(target);
+    if (entry) cooled.push(`${describe(target)} is cooled down (${entry.reason}${entry.until ? ` until ${entry.until}` : ""})`);
+    else fire.push(target);
+  }
+  if (!fire.length) return none("all-targets-cooled-down", ...reasons, ...cooled);
+  return { fire, reasons: [...reasons, ...cooled], suppressor: null };
+}
+
 // ── Route shadowing (dive-ours §5.4) ────────────────────────────────────────────────────────────
 
 export interface ShadowWarning {
@@ -250,7 +296,8 @@ export interface ShadowWarning {
   shadowing: { index: number; match: string };
   /** Index and pattern of the specific route that can never be reached. */
   shadowed: { index: number; match: string };
-  reasons: CompactionReason[];
+  /** The slots the shadowing applies to. Includes `worker` since W5 gave routes that slot too. */
+  reasons: RouteSlot[];
   message: string;
 }
 
