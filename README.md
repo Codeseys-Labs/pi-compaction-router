@@ -139,7 +139,7 @@ compaction assertion as a broken probe, not evidence about the router.
 - The package performs no direct network or subprocess operations; model calls go through Pi's model registry and native compaction function.
 - The context-fit estimate intentionally overestimates code-heavy input but is not exact provider tokenization.
 - Model fallback after a failed provider call can incur partial provider cost.
-- If every configured target is skipped or throws, the hook warns and returns control to Pi's native active-model handler: this is **fail-open**, not fail-closed.
+- If every configured target is skipped or throws, the hook returns control to Pi's native active-model handler: this is **fail-open**, not fail-closed. That outcome is reported to the operator as a widget above the editor, raised after the compaction commits and retracted by the next one. It is not a `notify`: Pi clears and rebuilds the chat container on `compaction_end`, which destroys anything the before-hook put there.
 - Automatic resume does not prove that unfinished work exists; leave it disabled if strict turn control matters.
 
 ## Development

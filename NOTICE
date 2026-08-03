@@ -5,3 +5,18 @@ Copyright (c) 2026 JMHSV, licensed under the MIT License.
 The native compaction integration and file-operation restoration logic are derived
 from that project. Routing, fallback, validation, diagnostics, and post-compaction
 resume behavior are additional work in pi-compaction-router.
+
+This project also adapts portions of pi-openai-server-compaction:
+https://github.com/algal/pi-openai-server-compaction
+Copyright (c) 2026 Alexis Gallagher, licensed under the MIT License.
+Taken from PR #7 head 9ea79cb89fecca4c7ab09739530ee78a654cd32f (refs/pull/7/head),
+read at that commit -- not from a published tarball.
+
+The pending-warning stash in src/pending-warning.ts, and the reason it exists -- that a
+before-compaction ui.notify is destroyed by the post-compaction chat rebuild, so an
+operator-visible warning has to be re-emitted afterwards as a ui.setWidget widget -- are
+adapted from that project's src/state.ts and src/index.ts. The finding was re-verified
+against this project's own pinned @earendil-works/pi-coding-agent 0.81.1 rather than
+adopted on the upstream author's word. Nothing else from that project is used here: its
+WebSocket transport, provider takeover, Codex identity headers and remote-compaction
+protocol are all out of scope for a router.
