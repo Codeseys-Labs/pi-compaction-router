@@ -26,10 +26,12 @@
     ]
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.81.1",
     "@earendil-works/pi-coding-agent": ">=0.81.1",
     "@earendil-works/pi-tui": ">=0.81.1"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "^0.81.1",
     "@earendil-works/pi-coding-agent": "^0.81.1",
     "@earendil-works/pi-tui": "^0.81.1",
     "@types/bun": "latest",
