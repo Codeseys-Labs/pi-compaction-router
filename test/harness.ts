@@ -11,7 +11,23 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { buildPreparation, type PreparationOptions } from "./fixtures/real-mass.js";
+
+/**
+ * Give the process a theme, so `getSettingsListTheme()` does not throw inside a `custom()` callback.
+ *
+ * This models pi's own startup, which calls `initTheme(...)` before it ever builds a TUI component
+ * (`dist/cli/startup-ui.js`, `createStartupTui`). Without it, `getSettingsListTheme()` raises
+ * "Theme not initialized. Call initTheme() first." -- the third sharp edge in
+ * `pi-settings-ui-surface.md`, and the reason the config command fetches its theme inside the callback
+ * and gates on `ctx.mode === "tui"` rather than importing one at module scope.
+ *
+ * Calling it here is what makes the settings dialog drivable headlessly. It is a global, and it is
+ * called once per module load rather than per test, deliberately: `initTheme` falls back to "dark"
+ * silently on any failure, so it cannot throw and cannot leave the process without a theme.
+ */
+initTheme("dark");
 
 export interface Notice { message: string; level: string }
 export interface WidgetCall { key: string; content: string[] | undefined }
@@ -73,7 +89,77 @@ export class FakeInteractiveUI {
   widgetKeys(): string[] {
     return [...this.widgets.keys()];
   }
+
+  // ── The settings-dialog half (W4) ─────────────────────────────────────────────────────────────
+  //
+  // `custom()` and `editor()` are how the interactive config surface reaches an operator, and both are
+  // modelled here rather than stubbed away, because the properties W4 owes -- that the command is gated
+  // on TUI mode, that the advanced row still reaches the editor, that closing the dialog is what
+  // triggers the write -- are all properties of WHEN these get called.
+
+  /** Every `ctx.ui.editor` call, so a test can prove the raw-JSON escape hatch was reached. */
+  readonly editorCalls: Array<{ title: string; prefill?: string }> = [];
+  /** What the next `editor()` returns. `undefined` models the operator cancelling. */
+  editorResult: string | undefined = undefined;
+  /** Every `ctx.ui.custom` call, so a test can prove the dialog was (or was not) opened. */
+  customCalls = 0;
+  /**
+   * Drives the component `custom()` builds. Receives the same `(tui, theme, keybindings, done)` the
+   * real one does, then hands the built component to `driveCustom` so a test can feed it keystrokes.
+   *
+   * `done` resolves the `custom()` promise, exactly as pi's does -- which is what lets the command's
+   * post-dialog code (validate, write, notify) run in the test.
+   */
+  driveCustom: ((component: DrivableComponent) => void) | undefined = undefined;
+
+  editor = async (title: string, prefill?: string): Promise<string | undefined> => {
+    this.editorCalls.push({ title, prefill });
+    return this.editorResult;
+  };
+
+  custom = async <T>(factory: CustomFactory<T>): Promise<T | undefined> => {
+    this.customCalls++;
+    let settled = false;
+    let result: T | undefined;
+    // A minimal `tui`: `requestRender` is the only method the components under test call, and counting
+    // it proves a state change asked for a repaint rather than sitting invisible.
+    const tui = { requestRender: () => { this.renderRequests++; } };
+    const component = factory(tui, FAKE_THEME, FAKE_KEYBINDINGS, (value: T) => {
+      if (settled) return;
+      settled = true;
+      result = value;
+    });
+    this.driveCustom?.(component);
+    return result;
+  };
+
+  renderRequests = 0;
 }
+
+/** The shape `ctx.ui.custom` returns and this harness drives. */
+export interface DrivableComponent {
+  render(width: number): string[];
+  invalidate?(): void;
+  handleInput?(data: string): void;
+}
+
+export type CustomFactory<T> = (
+  tui: { requestRender: () => void },
+  theme: unknown,
+  keybindings: unknown,
+  done: (result: T) => void,
+) => DrivableComponent;
+
+/**
+ * A stand-in for pi's `Theme`. The components under test never touch it -- they take their
+ * `SettingsListTheme`/`SelectListTheme` from `getSettingsListTheme()`/`getSelectListTheme()` inside the
+ * callback -- but `custom()`'s signature passes one, so the harness has to supply something.
+ */
+const FAKE_THEME = { fg: (_c: string, t: string) => t, bold: (t: string) => t } as unknown;
+const FAKE_KEYBINDINGS = {} as unknown;
+
+/** The real key bytes, shared with `test/settings-ui.test.ts`. */
+export const KEYS = { up: "\x1b[A", down: "\x1b[B", enter: "\r", escape: "\x1b", backspace: "\x7f" } as const;
 
 export interface HostOptions {
   /** Router settings written under the `compactionRouter` key. */
@@ -93,6 +179,18 @@ export interface HostOptions {
    * be a scratch dir; nothing in this suite may point at `~/.pi`.
    */
   agentDir?: string;
+  /**
+   * `ctx.mode`. Defaults to `"tui"` so the interactive config surface is reachable; set `"rpc"` to prove
+   * the mode gate refuses. Note that `hasUI` stays true for `"rpc"`, which is the whole point of gating
+   * on `mode` rather than `hasUI` -- an RPC host has dialogs but no terminal to draw a component on.
+   */
+  mode?: "tui" | "rpc" | "print";
+  /** `ctx.isProjectTrusted()`. Defaults to false, matching the pre-W4 harness. */
+  projectTrusted?: boolean;
+  /** `ctx.cwd`. Defaults to a fresh scratch project dir. */
+  cwd?: string;
+  /** What the registry reports for `getAvailable()`, for the settings dialog's provider/model lists. */
+  availableModels?: Array<{ id: string; provider: string; name?: string; contextWindow?: number; reasoning?: boolean }>;
 }
 
 export interface Host {
@@ -116,6 +214,8 @@ export interface Host {
    * feature works. NEVER `~/.pi`.
    */
   readonly agentDir: string;
+  /** Every `pi.appendEntry` the extension made -- the session-scoped mirror of a settings write. */
+  readonly entries: ReadonlyArray<{ customType: string; data: unknown }>;
 }
 
 /**
@@ -134,23 +234,38 @@ export async function withHost<T>(
     const mod = await loader();
     const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    /** Every `pi.appendEntry` call, so a test can prove the session mirror was written. */
+    const entries: Array<{ customType: string; data: unknown }> = [];
     (mod.default as (pi: unknown) => void)({
       on: (name: string, fn: (event: unknown, ctx: unknown) => unknown) => handlers.set(name, fn),
       registerCommand: (name: string, spec: { handler: (args: string, ctx: unknown) => unknown }) => commands.set(name, spec.handler),
       addCommand: () => {},
       addTool: () => {},
       sendMessage: () => {},
+      appendEntry: (customType: string, data: unknown) => { entries.push({ customType, data }); },
     });
 
     const ui = new FakeInteractiveUI();
+    const available = options.availableModels ?? [];
     const ctx: Record<string, unknown> = {
-      cwd: projectDir(),
+      cwd: options.cwd ?? projectDir(),
       sessionManager: { getSessionId: () => options.sessionId ?? "test-session", getSessionFile: () => null },
-      isProjectTrusted: () => false,
+      isProjectTrusted: () => options.projectTrusted ?? false,
       model: { provider: "anthropic", id: "claude-sonnet-4-5", contextWindow: 200_000 },
+      // `mode` defaults to "tui" so the interactive surface is reachable. `hasUI` is true for both "tui"
+      // and "rpc" (pi's own rule), which is exactly why the config command gates on `mode`.
+      mode: options.mode ?? "tui",
+      hasUI: (options.mode ?? "tui") !== "print",
       modelRegistry: {
-        find: () => options.findModel ?? null,
+        // `find` prefers a real lookup against `availableModels` when the caller supplied any, so a
+        // settings-dialog test gets a registry whose `find` and `getAvailable` AGREE -- validation is a
+        // round-trip and a registry that disagreed with itself would make it meaningless.
+        find: (provider?: string, id?: string) =>
+          available.length ? available.find(m => m.provider === provider && m.id === id) ?? null : options.findModel ?? null,
         getApiKeyAndHeaders: async () => options.auth ?? { ok: false, error: "no credentials in this test" },
+        getAvailable: () => available,
+        getProviderDisplayName: (p: string) => p,
+        getProviderAuthStatus: () => ({ configured: true, label: "TEST_KEY" }),
       },
     };
     if (!options.withoutUI) ctx.ui = ui;
@@ -172,6 +287,7 @@ export async function withHost<T>(
       ui,
       ctx,
       agentDir,
+      entries,
     };
     return await body(host);
   } finally {

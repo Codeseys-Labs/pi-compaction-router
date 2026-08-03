@@ -72,12 +72,31 @@ A failed target is now classified rather than simply abandoned:
 
 Settings are re-read at every compaction, so global or trusted project changes take effect during the current session without `/reload`.
 
-### Session-local configuration
+### Interactive configuration
 
-Use `/compaction-router-config` to edit a JSON override for only the current session. The editor starts with the effective global/project configuration. The saved override applies immediately and is discarded at session shutdown.
+`/compaction-router-config` with no arguments opens a settings list: one row per compaction reason, plus auto-resume and an advanced row.
 
 ```text
-/compaction-router-config
+manual       anthropic/claude-sonnet-4-5
+threshold    (not routed)
+overflow     anthropic/claude-sonnet-4-5
+auto-resume  off
+advanced     open editor
+```
+
+Enter on a reason row drills down — providers first, then that provider's models, with context window and reasoning shown so a model too small to hold the summarization prompt is visible before it is picked rather than after it is skipped. Typing filters the model list. Escape from the model list returns to the providers; Escape again closes the dialog.
+
+Only providers with working credentials are listed, because the list is derived from the model catalogue Pi has already authenticated. Nothing on this path performs a network refresh.
+
+Closing the dialog after a change writes the `compactionRouter` key of your global `settings.json`, preserving every other key in the file. The write is refused rather than applied if the file changed while the dialog was open, and the operator is told to reopen it. Routes you wrote by hand are never rewritten — the interactive surface owns only routes whose `match` is `*` — and because the first matching route wins, a hand-written route continues to take precedence. When it does, the dialog says so instead of reporting a success that routing disagrees with.
+
+Requires the interactive TUI. Project-scoped settings are written only when the project is trusted *and* already carries a `compactionRouter` key; otherwise the write goes to global, so the dialog never creates routing configuration in a file that travels with the repository.
+
+### Session-local configuration
+
+The `advanced` row, and any argument to the command, reach the raw-JSON editor. That override applies immediately and is discarded at session shutdown — it is the way to author what the rows cannot express: multi-target fallback chains, per-target thinking levels and cooldowns, and glob routes narrower than a catch-all.
+
+```text
 /compaction-router-config off
 /compaction-router-config reset
 /compaction-router-config {"models":[{"model":"openai-codex/gpt-5.4-mini","thinkingLevel":"low"}]}
@@ -85,7 +104,7 @@ Use `/compaction-router-config` to edit a JSON override for only the current ses
 
 - `off` disables routing for this session.
 - `reset` returns the session to live global/project settings.
-- Inline JSON supports RPC and scripted use without an interactive editor.
+- Inline JSON supports RPC and scripted use without an interactive editor, and works in every run mode.
 - Invalid JSON, route entries, reasons, or thinking levels are rejected rather than partially applied.
 
 ## Post-compaction continuation
@@ -102,10 +121,10 @@ After successful compaction, the extension injects a visible custom continuation
 ## Commands
 
 - `/compaction-router` — show active model, configuration source, routes, fallback order, thinking levels, auto-resume policy, and — once anything has been compacted — the savings meter and per-target health.
-- `/compaction-router-config [off|reset|JSON]` — edit or replace the current session's routing policy.
+- `/compaction-router-config` — open the interactive routing settings (TUI only); with `off`, `reset` or JSON, edit the current session's override in any mode.
 - `/compact-resume [instructions]` — compact and explicitly continue.
 
-Pi does not currently expose an extension API for adding arbitrary fields to the built-in `/settings` menu. Persistent configuration remains reviewable in JSON; the package-owned command is intentionally session-scoped.
+Pi does not expose an extension API for adding fields to the built-in `/settings` menu, so this package owns its own command. It does expose the components that menu is built from, and the interactive surface above uses them; configuration remains plain JSON on disk and reviewable there.
 
 ## The compaction ledger and the savings meter
 
