@@ -87,6 +87,12 @@ export interface HostOptions {
   sessionId?: string;
   /** Omit the ui entirely, to model a non-interactive host. */
   withoutUI?: boolean;
+  /**
+   * Reuse an existing scratch agent dir instead of minting a fresh one, so two `withHost` calls can
+   * share persisted state -- which is the only way to prove a cooldown SURVIVES a session. Must still
+   * be a scratch dir; nothing in this suite may point at `~/.pi`.
+   */
+  agentDir?: string;
 }
 
 export interface Host {
@@ -102,8 +108,12 @@ export interface Host {
   readonly ctx: Record<string, unknown>;
   /**
    * The throwaway agent dir this host redirected `PI_CODING_AGENT_DIR` to -- where `getAgentDir()`
-   * resolves, and so where the ledger is written. Exposed so a test can read the artifact the code
-   * actually produced instead of being told a path. NEVER `~/.pi`.
+   * resolves, and so where both the ledger and the cooldown file are written.
+   *
+   * Exposed so a test can read the artifact the code actually produced instead of being told a path,
+   * and -- more to the point -- so it can assert on WHERE. `~/.pi` is the operator's real home; a
+   * suite that wrote a cooldown or a ledger row into it would be corrupting live state to prove a
+   * feature works. NEVER `~/.pi`.
    */
   readonly agentDir: string;
 }
@@ -118,7 +128,7 @@ export async function withHost<T>(
   loader: () => Promise<{ default: unknown }> = () => import("../src/index.js"),
 ): Promise<T> {
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-  const agentDir = agentDirWith({ ...options.hostSettings, compactionRouter: options.routerConfig });
+  const agentDir = options.agentDir ?? agentDirWith({ ...options.hostSettings, compactionRouter: options.routerConfig });
   process.env.PI_CODING_AGENT_DIR = agentDir;
   try {
     const mod = await loader();

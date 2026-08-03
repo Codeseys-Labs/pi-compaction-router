@@ -6,10 +6,28 @@ export type CompactionReason = (typeof REASONS)[number];
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
-export interface ModelTarget { model: string; thinkingLevel?: ThinkingLevel }
+export interface ModelTarget {
+  model: string;
+  thinkingLevel?: ThinkingLevel;
+  /**
+   * How long this target stays cooled down after a failure that earned one, overriding the
+   * router-wide `cooldownHours`. `0` means "skip it for the rest of this process, write nothing to
+   * disk" -- pi-blackhole's semantic, kept because a read-only or ephemeral home must never be forced
+   * into a disk write. See `src/cooldown.ts`.
+   */
+  cooldownHours?: number;
+}
 export interface Route { match: string; models: ModelTarget[]; reasons: CompactionReason[] }
 export interface ResumeConfig { reasons: CompactionReason[]; message: string }
-export interface RouterConfig { routes: Route[]; defaults: ModelTarget[]; resume: ResumeConfig }
+export interface RouterConfig {
+  routes: Route[];
+  defaults: ModelTarget[];
+  resume: ResumeConfig;
+  /** Router-wide cooldown duration; a target's own `cooldownHours` wins. Undefined = 1 hour. */
+  cooldownHours?: number;
+  /** Retries per target before the chain advances. Undefined = `DEFAULT_MAX_RETRIES` (3). */
+  maxRetries?: number;
+}
 export type SessionOverrideResult = { ok: true; config: RouterConfig | null } | { ok: false; error: string };
 
 type Rec = Record<string, unknown>;
@@ -23,6 +41,18 @@ function reasons(v: unknown, fallback: CompactionReason[], warn: (s: string) => 
   if (!Array.isArray(v) || !v.every(validReason)) { warn("Invalid reasons list; using defaults."); return fallback; }
   return [...new Set(v)];
 }
+/**
+ * A non-negative hour count, or `undefined` when the value is absent or unusable.
+ *
+ * `0` is a MEANINGFUL value here (memory-only cooldown), so it must survive every guard that a
+ * falsy-check would eat. That is the whole reason this is a named helper rather than `Number(v) || undefined`.
+ */
+function hours(v: unknown, label: string, warn: (s: string) => void): number | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0) { warn(`Ignoring invalid ${label} '${String(v)}'; it must be a non-negative number.`); return undefined; }
+  return v;
+}
+
 function target(v: unknown, warn: (s: string) => void): ModelTarget | null {
   if (!record(v) || typeof v.model !== "string" || !v.model.trim()) { warn("Ignoring model target without provider/model."); return null; }
   let thinkingLevel: ThinkingLevel | undefined;
@@ -30,7 +60,7 @@ function target(v: unknown, warn: (s: string) => void): ModelTarget | null {
     if (typeof v.thinkingLevel === "string" && (THINKING_LEVELS as readonly string[]).includes(v.thinkingLevel)) thinkingLevel = v.thinkingLevel as ThinkingLevel;
     else warn(`Ignoring invalid thinking level '${String(v.thinkingLevel)}'.`);
   }
-  return { model: v.model.trim(), thinkingLevel };
+  return { model: v.model.trim(), thinkingLevel, cooldownHours: hours(v.cooldownHours, "cooldownHours", warn) };
 }
 function targets(v: unknown, warn: (s: string) => void): ModelTarget[] {
   if (!Array.isArray(v)) return [];
@@ -55,7 +85,12 @@ export function resolveConfig(globalSettings: unknown, projectSettings: unknown,
     message: typeof rr.message === "string" && rr.message.trim() ? rr.message.trim() : DEFAULT_RESUME,
   };
   if (!routes.length && !defaults.length && !resume.reasons.length) return null;
-  return { routes, defaults, resume };
+  return { routes, defaults, resume, cooldownHours: hours(raw.cooldownHours, "cooldownHours", warn), maxRetries: hours(raw.maxRetries, "maxRetries", warn) };
+}
+
+/** The cooldown duration that applies to one target: its own value wins, then the router-wide one. */
+export function cooldownHoursFor(config: Pick<RouterConfig, "cooldownHours">, target: Pick<ModelTarget, "cooldownHours">): number | undefined {
+  return target.cooldownHours ?? config.cooldownHours;
 }
 
 export function loadConfig(ctx: ExtensionContext): RouterConfig | null {
@@ -86,6 +121,11 @@ export function configToSettingsValue(config: RouterConfig | null): false | Rec 
       reasons: config.resume.reasons,
       message: config.resume.message,
     },
+    // Spread-conditional rather than `cooldownHours: config.cooldownHours`: an explicit `undefined`
+    // survives `JSON.stringify` as an absent key on the way out but not on the way back in through
+    // `resolveConfig`, and the round-trip test compares the parsed config to the original.
+    ...(config.cooldownHours === undefined ? {} : { cooldownHours: config.cooldownHours }),
+    ...(config.maxRetries === undefined ? {} : { maxRetries: config.maxRetries }),
   };
 }
 
@@ -111,7 +151,5 @@ export function globMatch(pattern: string, value: string): boolean {
   const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
   return new RegExp(`^${escaped}$`, "i").test(value);
 }
-export function selectTargets(config: RouterConfig, activeModel: string, reason: CompactionReason): ModelTarget[] {
-  const route = config.routes.find(r => r.reasons.includes(reason) && globMatch(r.match, activeModel));
-  return route?.models ?? config.defaults;
-}
+// `selectTargets` lives in `src/selection.ts` as of W2: it now returns `{fire, reasons, suppressor}`
+// and consults the cooldown store, which is more than a config module should know about.
