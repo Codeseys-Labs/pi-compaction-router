@@ -1,8 +1,23 @@
 import { getAgentDir, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RetryPolicy } from "@earendil-works/pi-ai";
+import { resolvePreservationConfig, type PreservationConfig } from "./preservation.js";
 
 export const REASONS = ["manual", "threshold", "overflow"] as const;
 export type CompactionReason = (typeof REASONS)[number];
+
+/**
+ * The observer worker's slot in the route table (W5).
+ *
+ * Deliberately NOT a member of `REASONS`: `CompactionReason` is what pi's `session_before_compact`
+ * event reports, and widening it would put a non-existent compaction reason into the resume policy,
+ * the settings rows and the ledger's `reason` field. A route opts into the worker slot by naming it
+ * explicitly, so every route written before W5 keeps covering exactly the three compaction reasons it
+ * already covered -- `reasons()` below defaults to `[...REASONS]`, never to all slots.
+ */
+export const WORKER_SLOT = "worker";
+export type RouteSlot = CompactionReason | typeof WORKER_SLOT;
+export const ROUTE_SLOTS = [...REASONS, WORKER_SLOT] as const;
+
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
@@ -17,7 +32,7 @@ export interface ModelTarget {
    */
   cooldownHours?: number;
 }
-export interface Route { match: string; models: ModelTarget[]; reasons: CompactionReason[] }
+export interface Route { match: string; models: ModelTarget[]; reasons: RouteSlot[] }
 export interface ResumeConfig { reasons: CompactionReason[]; message: string }
 export interface RouterConfig {
   routes: Route[];
@@ -27,6 +42,17 @@ export interface RouterConfig {
   cooldownHours?: number;
   /** Retries per target before the chain advances. Undefined = `DEFAULT_MAX_RETRIES` (3). */
   maxRetries?: number;
+  /**
+   * The W5 preservation layer. Always present and `enabled: false` unless the operator set
+   * `preservation.enabled: true` -- so reading this field can never be the thing that turns the
+   * observer on.
+   */
+  preservation: PreservationConfig;
+  /**
+   * Dedicated worker targets, tried before the `worker`-slot routes. The cheap-model slot from
+   * verdict §3's row list ("plus the memory-worker model once §2.1 exists").
+   */
+  workerModels: ModelTarget[];
 }
 export type SessionOverrideResult = { ok: true; config: RouterConfig | null } | { ok: false; error: string };
 
@@ -35,10 +61,25 @@ const DEFAULT_RESUME = "Compaction completed. Resume the in-progress task from t
 const record = (v: unknown): v is Rec => typeof v === "object" && v !== null && !Array.isArray(v);
 const section = (v: unknown): unknown => record(v) ? v.compactionRouter : undefined;
 const validReason = (v: unknown): v is CompactionReason => typeof v === "string" && (REASONS as readonly string[]).includes(v);
+const validSlot = (v: unknown): v is RouteSlot => typeof v === "string" && (ROUTE_SLOTS as readonly string[]).includes(v);
 
 function reasons(v: unknown, fallback: CompactionReason[], warn: (s: string) => void): CompactionReason[] {
   if (v === undefined) return fallback;
   if (!Array.isArray(v) || !v.every(validReason)) { warn("Invalid reasons list; using defaults."); return fallback; }
+  return [...new Set(v)];
+}
+
+/**
+ * A route's slot list, which may include `worker` as well as the three compaction reasons.
+ *
+ * Separate from `reasons()` above rather than a widening of it, because the two callers want different
+ * vocabularies: a ROUTE may serve the worker slot, a RESUME policy may not (there is no compaction to
+ * resume after an observer call). Keeping them apart is what makes `resume.reasons: ["worker"]` an
+ * invalid-value warning instead of a silently accepted no-op.
+ */
+function routeSlots(v: unknown, warn: (s: string) => void): RouteSlot[] {
+  if (v === undefined) return [...REASONS];
+  if (!Array.isArray(v) || !v.every(validSlot)) { warn(`Invalid route reasons list; using the three compaction reasons. Valid values are ${ROUTE_SLOTS.join(", ")}.`); return [...REASONS]; }
   return [...new Set(v)];
 }
 /**
@@ -76,16 +117,21 @@ export function resolveConfig(globalSettings: unknown, projectSettings: unknown,
   if (Array.isArray(raw.routes)) for (const item of raw.routes) {
     if (!record(item) || typeof item.match !== "string" || !item.match.trim()) { warn("Ignoring route without a match pattern."); continue; }
     const models = targets(item.models, warn); if (!models.length) { warn(`Ignoring route '${item.match}' without valid models.`); continue; }
-    routes.push({ match: item.match.trim(), models, reasons: reasons(item.reasons, [...REASONS], warn) });
+    routes.push({ match: item.match.trim(), models, reasons: routeSlots(item.reasons, warn) });
   }
   const defaults = targets(raw.models, warn);
+  const workerModels = targets(raw.workerModels, warn);
   const rr = record(raw.resume) ? raw.resume : {};
   const resume: ResumeConfig = {
     reasons: rr.enabled === true ? reasons(rr.reasons, ["manual", "threshold"], warn) : [],
     message: typeof rr.message === "string" && rr.message.trim() ? rr.message.trim() : DEFAULT_RESUME,
   };
-  if (!routes.length && !defaults.length && !resume.reasons.length) return null;
-  return { routes, defaults, resume, cooldownHours: hours(raw.cooldownHours, "cooldownHours", warn), maxRetries: hours(raw.maxRetries, "maxRetries", warn) };
+  const preservation = resolvePreservationConfig(raw.preservation, warn);
+  // A `preservation` section counts as useful configuration only when it is actually enabled: a host
+  // that wrote `preservation: {enabled: false}` and nothing else has configured nothing, and returning
+  // a config for it would make `/compaction-router` claim the package is active when no route exists.
+  if (!routes.length && !defaults.length && !resume.reasons.length && !preservation.enabled) return null;
+  return { routes, defaults, resume, cooldownHours: hours(raw.cooldownHours, "cooldownHours", warn), maxRetries: hours(raw.maxRetries, "maxRetries", warn), preservation, workerModels };
 }
 
 /** The cooldown duration that applies to one target: its own value wins, then the router-wide one. */
@@ -126,6 +172,26 @@ export function configToSettingsValue(config: RouterConfig | null): false | Rec 
     // `resolveConfig`, and the round-trip test compares the parsed config to the original.
     ...(config.cooldownHours === undefined ? {} : { cooldownHours: config.cooldownHours }),
     ...(config.maxRetries === undefined ? {} : { maxRetries: config.maxRetries }),
+    // Both W5 keys are emitted ONLY when they carry something. An always-present
+    // `preservation: {enabled: false, ...}` would rewrite every operator's settings file with a
+    // section they never asked for, and -- worse for the round trip -- `resolveConfig` treats a
+    // disabled preservation section as "no configuration", so emitting one would not even survive a
+    // re-parse into the same object.
+    ...(config.workerModels.length ? { workerModels: config.workerModels } : {}),
+    ...(config.preservation.enabled ? { preservation: preservationToSettingsValue(config.preservation) } : {}),
+  };
+}
+
+/** The `preservation` section as settings JSON. Only reached when the layer is enabled. */
+function preservationToSettingsValue(preservation: PreservationConfig): Rec {
+  return {
+    enabled: true,
+    observeAfterTokens: preservation.observeAfterTokens,
+    mode: preservation.mode,
+    ratio: preservation.ratio,
+    maxFacts: preservation.maxFacts,
+    injectFold: preservation.injectFold,
+    ...(preservation.observerChunkMaxTokens === undefined ? {} : { observerChunkMaxTokens: preservation.observerChunkMaxTokens }),
   };
 }
 
