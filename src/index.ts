@@ -1,6 +1,7 @@
 import { compact, convertToLlm, getAgentDir, getSettingsListTheme, getSelectListTheme, serializeConversation, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionCompactEvent } from "@earendil-works/pi-coding-agent";
 import type { SettingItem } from "@earendil-works/pi-tui";
 import { advancesChain, chainExhausted, chainHalt, type ChainStop } from "./chain.js";
+import { detectForeignSummary } from "./collision.js";
 import { configToSettingsValue, cooldownHoursFor, loadConfig, loadRetryPolicy, parseModelReference, parseSessionOverride, REASONS, type CompactionReason, type ModelTarget, type RouterConfig } from "./config.js";
 import { CooldownStore } from "./cooldown.js";
 import { ACTIVE_MODEL_TARGET, appendRow, clearRouteRecord, estimateSummaryTokens, formatSavingsRows, readSavings, setRouteRecord, takeRouteRecord, type LedgerRow, type RouteRecord, type ServingTarget } from "./ledger.js";
@@ -8,7 +9,7 @@ import { validateReference, type PickableRegistry } from "./model-picker.js";
 import { clearPendingWarning, setPendingWarning, takePendingWarning } from "./pending-warning.js";
 import { formatHealthRows, ProviderHealth } from "./provider-health.js";
 import { classifyFailure, withTargetRetry, type Classification } from "./retry.js";
-import { checkMaxTokens, findRouteShadowing, selectTargets, type Suppressor } from "./selection.js";
+import { checkMaxTokens, findRouteShadowing, rankByFit, selectTargets, type Suppressor } from "./selection.js";
 import { ADVANCED_ROW, RESUME_ROW, RESUME_VALUES, RouterDraft } from "./settings-draft.js";
 import { readSnapshot, SETTINGS_KEY, SettingsWriteError, writeSection, type SettingsScope } from "./settings-store.js";
 import { buildSettingsDialog, ProviderModelPicker } from "./settings-ui.js";
@@ -22,6 +23,13 @@ const warn = (message: string, error?: unknown) => error === undefined ? console
 
 /** Key for the durable not-routed banner. One key, so re-setting it replaces rather than stacks. */
 const NOT_ROUTED_WIDGET_KEY = `${TAG}:not-routed`;
+
+/**
+ * Key for the hook-collision banner. Deliberately NOT the not-routed key: the two facts are
+ * independent and can hold at once ("nothing of ours ran" AND "someone else's summary was
+ * committed"), so sharing a key would let one silently overwrite the other.
+ */
+const COLLISION_WIDGET_KEY = `${TAG}:collision`;
 
 /** The rows whose drill-down produces a model reference, and so whose picks need validating. */
 const REASON_ROWS = REASONS;
@@ -79,26 +87,44 @@ function estimatedInputTokens(preparation: Pick<Preparation, "messagesToSummariz
 }
 
 /**
- * Raise the not-routed banner in the widget container, which survives the post-compaction chat
- * rebuild. Wrapped and optional-chained for the same reason the notify was: a host may expose no ui,
- * and a failed notice must never be why a compaction breaks.
+ * Write one widget key, in the container that survives the post-compaction chat rebuild. Wrapped and
+ * optional-chained for the same reason the notify was: a host may expose no ui, and a failed notice
+ * must never be why a compaction breaks. `undefined` retracts.
  */
-function showNotRoutedWidget(ctx: Pick<ExtensionContext, "ui">, lines: string[]): void {
+function setWidget(ctx: Pick<ExtensionContext, "ui">, key: string, lines: string[] | undefined): void {
   try {
-    ctx.ui?.setWidget?.(NOT_ROUTED_WIDGET_KEY, lines);
+    ctx.ui?.setWidget?.(key, lines);
   } catch {
     // deliberately swallowed; the summary matters more than its notice
   }
 }
 
-/** Retract the banner, so a warning about an earlier compaction cannot linger past the one it describes. */
-function clearNotRoutedWidget(ctx: Pick<ExtensionContext, "ui">): void {
-  try {
-    ctx.ui?.setWidget?.(NOT_ROUTED_WIDGET_KEY, undefined);
-  } catch {
-    // deliberately swallowed; see above
+const showNotRoutedWidget = (ctx: Pick<ExtensionContext, "ui">, lines: string[]): void => setWidget(ctx, NOT_ROUTED_WIDGET_KEY, lines);
+
+/**
+ * Break one long sentence into widget lines.
+ *
+ * Pi renders at most 10 widget lines (`InteractiveMode.MAX_WIDGET_LINES`, `interactive-mode.js:1531`)
+ * and silently DROPS the rest, so a single 400-character string handed to `setWidget` is one line that
+ * the terminal wraps outside pi's accounting. The collision message is written as prose for a log and
+ * has to be re-flowed before it can be read in a widget. Word-wrapped at a conservative width and
+ * capped below pi's limit so the cap is never what an operator notices.
+ */
+function wrapForWidget(message: string, width = 96, maxLines = 8): string[] {
+  const lines: string[] = [];
+  let current = "";
+  for (const word of message.split(/\s+/)) {
+    if (!current) current = word;
+    else if (current.length + 1 + word.length <= width) current += ` ${word}`;
+    else { lines.push(current); current = word; }
+    if (lines.length === maxLines) return lines;
   }
+  if (current && lines.length < maxLines) lines.push(current);
+  return lines;
 }
+
+/** Retract the banner, so a warning about an earlier compaction cannot linger past the one it describes. */
+const clearNotRoutedWidget = (ctx: Pick<ExtensionContext, "ui">): void => setWidget(ctx, NOT_ROUTED_WIDGET_KEY, undefined);
 
 /**
  * Assemble and append one ledger row for a compaction pi has just committed.
@@ -221,6 +247,9 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     // describes a compaction this one supersedes.
     clearPendingWarning(sessionId);
     clearNotRoutedWidget(ctx);
+    // The collision banner is retracted for the same reason and on the same schedule: it names a
+    // specific compaction whose summary came from elsewhere, and the next compaction may not repeat it.
+    setWidget(ctx, COLLISION_WIDGET_KEY, undefined);
     // Same reason as the warning stash above: a route decision from a compaction that never reached
     // session_compact must not be attributed to this one.
     clearRouteRecord(sessionId);
@@ -258,19 +287,56 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     // the operator after the wrong thing. `configFor` above already read the same file, so this adds
     // no failure mode that was not already present.
     const retry = loadRetryPolicy(ctx);
-    let stop: ChainStop = chainExhausted(targets.length);
+    const reserve = event.preparation.settings.reserveTokens;
 
+    // CHEAPEST THAT FITS (G6). The operator's list says which targets are ALLOWED; this decides which
+    // allowed target is tried first, and it is a decision the router could not previously make -- the
+    // window was read only to reject and `cost` was never read at all. Ordering happens once, before
+    // the loop, because the ranking is a property of the prompt rather than of a hop.
+    //
+    // Ordering here is safe only because W1 fixed the estimator: `estimated` is now
+    // `serializeConversation(convertToLlm(...))/4` rather than a number that ran 3.7x-37.9x high, and
+    // cheapest-first over a bad estimate would have systematically preferred the small-window models
+    // that estimate wrongly excluded (verdict §5.5, risk 5).
+    //
+    // Non-fitting targets stay IN the chain, at the back. They are still tried, still reported, still
+    // recorded against provider health -- the ranking changes the order, never the operator's set.
+    //
+    // RESOLUTION HAPPENS ONCE, HERE, AND IS REPORTED HERE. Two reasons, and the second is the subtler:
+    //
+    //  1. Resolving per hop instead would double this package's registry lookups, and
+    //     `test/provider-health.test.ts` bounds them at one per configured target.
+    //  2. A target that cannot be resolved is a fact learned at THIS point, and ranking would otherwise
+    //     bury it: an unresolvable target does not fit, so it sorts to the back, so a chain that
+    //     succeeds earlier would never reach it and would never record what we already know. Reporting
+    //     at the point of discovery is what keeps "this target is unavailable" in the health record
+    //     regardless of where the ranking puts it.
+    //
+    // `find` is a synchronous in-memory catalogue read -- `ModelRegistry.find` -> `runtime.getModel` ->
+    // `Models.getModel` = `getModels(provider).find(...)` (`pi-ai/dist/models.js:69-71`), no network and
+    // no credential -- so resolving every candidate reaches no provider and costs the operator nothing.
+    // That is why the passivity rule is untouched by doing it up front: the paid doors are
+    // `getApiKeyAndHeaders` and `compact`, and both stay strictly inside the loop below.
+    const resolvable: { target: ModelTarget; model: NonNullable<ReturnType<typeof ctx.modelRegistry.find>> }[] = [];
     for (const target of targets) {
       const ref = parseModelReference(target.model);
       if (!ref) { warn(`Skipping invalid model '${target.model}'.`); continue; }
       const model = ctx.modelRegistry.find(ref.provider, ref.modelId);
-      // Every `health.record*` call below sits AFTER the thing it records, and describes only that
-      // thing. Nothing here asks a provider a question in order to have something to record.
+      // Every `health.record*` call sits AFTER the thing it records, and describes only that thing.
+      // Nothing here asks a provider a question in order to have something to record.
       if (!model) { health.recordFailure(target.model, "unavailable"); warn(`Skipping unavailable model '${target.model}'.`); continue; }
-      const reserve = event.preparation.settings.reserveTokens;
-      if (estimated + reserve > model.contextWindow) {
-        health.recordFailure(target.model, "too-small", `${estimated}-token estimate plus ${reserve} reserved exceeds a ${model.contextWindow}-token window`);
-        warn(`Skipping '${target.model}': conservative ${estimated}-token input estimate plus ${reserve} reserved tokens exceeds its ${model.contextWindow}-token context window.`);
+      resolvable.push({ target, model });
+    }
+    const ranking = rankByFit(resolvable, estimated, reserve);
+    let stop: ChainStop = chainExhausted(targets.length);
+
+    for (const { target, model, fits, window, reason } of ranking) {
+      if (!fits) {
+        // The fit refusal, now decided by `rankByFit` so that one rule serves both the ordering and the
+        // skip. `window` is post-override: a target carrying `contextWindow` is judged on the
+        // operator's number, which is the point of the override (blackhole steal 7).
+        health.recordFailure(target.model, "too-small", reason);
+        warn(`Skipping ${reason}.`);
         continue;
       }
       // The output side of the same arithmetic. Pi will ask for `0.8 x reserveTokens` output tokens
@@ -303,7 +369,11 @@ export default function compactionRouter(pi: ExtensionAPI): void {
         setRouteRecord(sessionId, {
           outcome: "routed",
           servedBy: { model: target.model, thinkingLevel: target.thinkingLevel, active: false },
-          window: model.contextWindow,
+          // The POST-OVERRIDE window, not `model.contextWindow`. When a target carries a
+          // `contextWindow` override, that is the number the fit decision was actually made on, and a
+          // ledger recording the registry's rejected value would misdescribe the decision it is the
+          // record of.
+          window,
           tokensBefore,
         });
         return { compaction: result };
@@ -375,7 +445,24 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     // and the committed `usage` exist only on this event. Written before the resume decision below,
     // which returns early on several paths: a meter that only records the compactions that also
     // triggered a nudge is not a meter.
-    writeLedgerRow(event, ctx, takeRouteRecord(sessionId), sessionId);
+    //
+    // The record is drained ONCE and reused, because `takeRouteRecord` deletes: calling it twice
+    // would give the collision check below `undefined` and hide every override we routed against.
+    const record = takeRouteRecord(sessionId);
+    writeLedgerRow(event, ctx, record, sessionId);
+
+    // THE OVERRIDE HAZARD. Pi runs every registered `session_before_compact` handler and keeps the
+    // LAST truthy result (`dist/core/extensions/runner.js:565-594`), so on a compaction where we
+    // returned nothing another owner's summary is what pi commits -- and on the fell-back path we may
+    // have paid a provider for a summary that was then discarded. Install-time arbitration does not
+    // exist in 0.81.1, so this is detectable only after the fact, and only here. The outcome is passed
+    // rather than a boolean so that "we were not running at all" is not reported as a collision; see
+    // src/collision.ts for why that distinction is load-bearing.
+    const collision = detectForeignSummary(event, record?.outcome);
+    if (collision) {
+      warn(collision.message);
+      setWidget(ctx, COLLISION_WIDGET_KEY, [`[${TAG}] hook collision:`, ...wrapForWidget(collision.message)]);
+    }
 
     // The compaction is committed by the time this fires, so the stashed warning can be checked
     // against the entry pi actually saved. `fromExtension` is pi's own record of whether a
@@ -595,6 +682,7 @@ export default function compactionRouter(pi: ExtensionAPI): void {
     clearPendingWarning(sessionId);
     clearRouteRecord(sessionId);
     clearNotRoutedWidget(ctx);
+    setWidget(ctx, COLLISION_WIDGET_KEY, undefined);
     // The memory-only cooldowns are this process's knowledge of what failed, and a new session is
     // entitled to try again. The persisted half is untouched: a rate limit outlives a session, which
     // is the entire reason it is on disk. Also sweeps expired entries, upstream's `expireCooldowns()`
@@ -605,6 +693,7 @@ export default function compactionRouter(pi: ExtensionAPI): void {
 }
 
 export * from "./chain.js";
+export * from "./collision.js";
 export * from "./config.js";
 export * from "./cooldown.js";
 export * from "./ledger.js";
