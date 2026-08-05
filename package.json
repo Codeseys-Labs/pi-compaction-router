@@ -1,6 +1,6 @@
 {
   "name": "pi-compaction-router",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "description": "Route Pi native compaction across configured models with safe fallback and optional post-compaction resume.",
   "license": "MIT",
