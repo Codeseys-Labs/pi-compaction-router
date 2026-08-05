@@ -5,8 +5,9 @@ import { advancesChain, chainExhausted, chainHalt, type ChainStop } from "./chai
 import { detectForeignSummary } from "./collision.js";
 import { configToSettingsValue, cooldownHoursFor, loadConfig, loadRetryPolicy, parseModelReference, parseSessionOverride, REASONS, type CompactionReason, type ModelTarget, type RouterConfig } from "./config.js";
 import { CooldownStore } from "./cooldown.js";
+import { carryFor, clearDegradation, recordDegradation } from "./degradation-notice.js";
 import { ACTIVE_MODEL_TARGET, appendRow, clearRouteRecord, estimateSummaryTokens, formatSavingsRows, readSavings, setRouteRecord, takeRouteRecord, type LedgerRow, type RouteRecord, type ServingTarget } from "./ledger.js";
-import { validateReference, type PickableRegistry } from "./model-picker.js";
+import { healthNotice, resolutionNotice, validateReference, type PickableRegistry } from "./model-picker.js";
 import { runObserver, type WorkerCall } from "./observer.js";
 import { clearPendingWarning, setPendingWarning, takePendingWarning } from "./pending-warning.js";
 import { buildCompactionCustomInstructions } from "./preservation-prompt.js";
@@ -34,6 +35,17 @@ const NOT_ROUTED_WIDGET_KEY = `${TAG}:not-routed`;
  * committed"), so sharing a key would let one silently overwrite the other.
  */
 const COLLISION_WIDGET_KEY = `${TAG}:collision`;
+
+/**
+ * Key for the one-shot carry-forward notice about an EARLIER fallback.
+ *
+ * A third key rather than a reuse of `NOT_ROUTED_WIDGET_KEY`, and the reason is the same as the
+ * collision key's: the two say different things about different compactions ("this one was not routed"
+ * versus "an earlier one was not, and this one was"), and they must never be able to overwrite each
+ * other. It is retracted on the next `session_before_compact` like both others, so "shown once" is
+ * enforced by the same schedule rather than by a promise in its own text.
+ */
+const DEGRADED_EARLIER_WIDGET_KEY = `${TAG}:degraded-earlier`;
 
 /** The rows whose drill-down produces a model reference, and so whose picks need validating. */
 const REASON_ROWS = REASONS;
@@ -590,6 +602,9 @@ export default function compactionRouter(pi: ExtensionAPI, options: { workerCall
     // The collision banner is retracted for the same reason and on the same schedule: it names a
     // specific compaction whose summary came from elsewhere, and the next compaction may not repeat it.
     setWidget(ctx, COLLISION_WIDGET_KEY, undefined);
+    // And the carry-forward notice, which is what makes "shown once" a mechanism rather than a promise
+    // in its own text: it was emitted against the previous compaction and this one supersedes it.
+    setWidget(ctx, DEGRADED_EARLIER_WIDGET_KEY, undefined);
     // Same reason as the warning stash above: a route decision from a compaction that never reached
     // session_compact must not be attributed to this one.
     clearRouteRecord(sessionId);
@@ -777,6 +792,11 @@ export default function compactionRouter(pi: ExtensionAPI, options: { workerCall
         ],
         routedByExtension: false,
       });
+      // And remember it past the banner's own lifetime. The banner above is retracted by the NEXT
+      // `session_before_compact` (correctly -- it describes this compaction), which is how an operator
+      // who was away from the terminal could miss a degradation entirely. See src/degradation-notice.ts
+      // for why the carry is exactly one following compaction and not a standing notice.
+      recordDegradation(sessionId, { targets: targets.map(t => t.model), cause: stop.message });
     }
     return;
   });
@@ -813,7 +833,20 @@ export default function compactionRouter(pi: ExtensionAPI, options: { workerCall
     // session_before_compact handler returned the compaction; if it did, this compaction WAS routed
     // and the warning is stale -- drop it rather than accuse a compaction that went fine.
     const pending = takePendingWarning(sessionId);
-    if (pending && pending.routedByExtension === event.fromExtension) showNotRoutedWidget(ctx, pending.lines);
+    const degradedNow = Boolean(pending) && pending?.routedByExtension === event.fromExtension;
+    if (pending && degradedNow) showNotRoutedWidget(ctx, pending.lines);
+    // A stash dropped as STALE also invalidates the carry record it was written beside: both assert that
+    // Pi's active model served that compaction, and `fromExtension` has just said otherwise. Carrying it
+    // forward would mean repeating, one compaction later, an accusation we have already withdrawn here.
+    if (pending && !degradedNow) clearDegradation(sessionId);
+
+    // The carry-forward, emitted only on a compaction that did NOT itself degrade -- a persistent fault
+    // raises its own live banner above and does not need a second notice. One line, once, then dropped.
+    const carry = carryFor(sessionId, degradedNow);
+    if (carry) {
+      setWidget(ctx, DEGRADED_EARLIER_WIDGET_KEY, carry);
+      clearDegradation(sessionId);
+    }
 
     if (event.willRetry) return; // Pi already resumes overflow recovery.
     if (explicitResumeSessions.delete(sessionId)) return;
@@ -987,7 +1020,11 @@ export default function compactionRouter(pi: ExtensionAPI, options: { workerCall
           ...(row.isReasonSlot
             // The drill-down. `SettingsList` delegates everything to what this returns until it calls
             // `done`, and on a defined value sets the row and fires `onChange` for us.
-            ? { submenu: (_current: string, finish: (value?: string) => void) => new ProviderModelPicker(registry, selectTheme, finish, requestRender) }
+            // `health.snapshot` is passed so a target whose last real call FAILED says so on its own row,
+            // before it is picked rather than after the next compaction discovers it. It is a synchronous
+            // Map read of calls already made -- the dialog asks no provider anything, which is the rule
+            // src/provider-health.ts exists to hold (and what makes this affordable in a UI path).
+            ? { submenu: (_current: string, finish: (value?: string) => void) => new ProviderModelPicker(registry, selectTheme, finish, requestRender, target => health.snapshot(target)) }
             : { values: [...RESUME_VALUES] }),
         }));
         items.push({
@@ -1023,13 +1060,20 @@ export default function compactionRouter(pi: ExtensionAPI, options: { workerCall
       // that passes here is one `session_before_compact` can resolve later. A failure writes nothing:
       // a settings file is not the place to discover a typo.
       const invalid: string[] = [];
+      const picked: string[] = [];
       for (const reason of REASON_ROWS) {
         const pick = draft.pickFor(reason);
         if (!pick) continue;
+        picked.push(pick);
         const check = validateReference(registry, pick);
         if (!check.ok && check.error) invalid.push(check.error);
       }
       if (invalid.length) { ctx.ui.notify(`Nothing was written. ${invalid.join(" ")}`, "error"); return; }
+      // The free half of an invocability check, read from calls this process already made. A target
+      // whose last real call failed is named at SELECTION time rather than at the next compaction --
+      // which is the reproduced case (a bare Bedrock id re-picked after it had already been refused
+      // once). A warning, never a refusal: see `healthNotice`.
+      const recorded = healthNotice([...new Set(picked)], target => health.snapshot(target));
 
       try {
         const written = writeSection({
@@ -1048,8 +1092,18 @@ export default function compactionRouter(pi: ExtensionAPI, options: { workerCall
         // route still out-ranks -- the one way a surgical write can succeed and mean nothing.
         const problems = draft.verifyEffective(SETTINGS_KEY);
         const summary = `Compaction router ${scope} settings updated (${written.path}).`;
-        if (problems.length) ctx.ui.notify(`${summary} But: ${problems.join(" ")}`, "warning");
-        else ctx.ui.notify(`${summary} New compactions use it immediately.`, "info");
+        // WHAT THE WRITE PROMISES, AND WHAT IT CANNOT. "New compactions use it immediately" is true
+        // about the SETTING and was read as a claim about the ROUTE: `validateReference` had only
+        // established that the reference resolves in the catalogue, and a catalogue lists Bedrock ids an
+        // on-demand call then refuses (reproduced live 2026-08-04 -- see `resolutionNotice`). The
+        // setting-scoped claim is kept, because it is the one this code can make and an operator does
+        // need to know no restart is required; `resolutionNotice()` follows it with the boundary and the
+        // remedy. `recorded`, when present, is the one invocability FACT this package owns for free, so
+        // it goes first and raises the level: a picked target we have already watched fail outranks a
+        // general caveat about targets we have not.
+        const head = problems.length ? `${summary} But: ${problems.join(" ")}` : `${summary} New compactions use it immediately.`;
+        const level = problems.length || recorded ? "warning" : "info";
+        ctx.ui.notify([head, recorded, resolutionNotice()].filter(Boolean).join(" "), level);
       } catch (error) {
         // A conflict or a held lock is an expected outcome, not a crash: report it in the operator's
         // language and leave the file alone. `configFor` re-reads settings per compaction, so there is
@@ -1069,6 +1123,11 @@ export default function compactionRouter(pi: ExtensionAPI, options: { workerCall
     clearRouteRecord(sessionId);
     clearNotRoutedWidget(ctx);
     setWidget(ctx, COLLISION_WIDGET_KEY, undefined);
+    // The carry record and its banner, for the same reason: a degradation belongs to the session it
+    // happened in, and carrying one into the next session would report it against a compaction that
+    // could not have caused it.
+    clearDegradation(sessionId);
+    setWidget(ctx, DEGRADED_EARLIER_WIDGET_KEY, undefined);
     // The preservation layer's per-session state. The FACTS are durable and stay in the session tree;
     // what is dropped here is the not-yet-visible mirror and the two in-flight guards, all of which
     // describe this process's view of this session and would be wrong for the next one. A guard left set
@@ -1089,6 +1148,7 @@ export * from "./chain.js";
 export * from "./collision.js";
 export * from "./config.js";
 export * from "./cooldown.js";
+export * from "./degradation-notice.js";
 export * from "./ledger.js";
 export * from "./observer.js";
 export * from "./pending-warning.js";

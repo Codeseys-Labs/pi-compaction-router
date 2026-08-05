@@ -41,6 +41,19 @@
  */
 
 import type { SelectItem } from "@earendil-works/pi-tui";
+import type { HealthSnapshot } from "./provider-health.js";
+
+/**
+ * The part of a recorded `HealthSnapshot` the picker reads, and the lookup that supplies it.
+ *
+ * Narrowed to four fields on purpose: this file must not be able to *change* health state, and a
+ * lookup is a synchronous in-memory `Map` read (`ProviderHealth.snapshot`) rather than a probe -- see
+ * `src/provider-health.ts` for why nothing here may ask a provider a question. `undefined` is the
+ * honest default for a caller with no record to offer, and every function below treats it as
+ * "nothing recorded" rather than as "healthy".
+ */
+export type PickableHealth = Pick<HealthSnapshot, "status" | "lastFailure" | "lastErrorMessage" | "consecutiveFailures">;
+export type HealthLookup = (target: string) => PickableHealth | undefined;
 
 /** The part of `Model<Api>` this package reads. Structural, so the tests need no real registry. */
 export interface PickableModel {
@@ -122,18 +135,52 @@ function formatWindow(tokens: number): string {
  * `contextWindow` earns its place in the description rather than being decoration: the fit guard in
  * `src/index.ts` skips a target whose window cannot hold the summarization prompt, and this is where
  * an operator can see that coming before they pick it.
+ *
+ * `health` is optional and free. When supplied it is `ProviderHealth.snapshot` -- a synchronous `Map`
+ * read of calls this package ALREADY made -- so a target whose last real call failed says so on its own
+ * row, before it is picked. That is the only signal in this file that reaches past `find()`, and it
+ * reaches no provider to get there. A target with nothing recorded is described exactly as it was
+ * before: silence is not a health claim (see `describeHealth`).
  */
-export function modelItems(models: PickableModel[]): SelectItem[] {
+export function modelItems(models: PickableModel[], health?: HealthLookup): SelectItem[] {
   return models.map(model => {
     const parts: string[] = [];
     if (typeof model.contextWindow === "number" && model.contextWindow > 0) parts.push(formatWindow(model.contextWindow));
     if (model.reasoning) parts.push("reasoning");
+    const reference = `${model.provider}/${model.id}`;
+    // Last, so the fit facts stay in the leading position an operator scans for, and so a row without a
+    // record renders byte-identically to the pre-health version.
+    const recorded = describeHealth(health?.(reference));
+    if (recorded) parts.push(recorded);
     return {
-      value: `${model.provider}/${model.id}`,
+      value: reference,
       label: model.name ?? model.id,
       ...(parts.length ? { description: parts.join(" · ") } : {}),
     };
   });
+}
+
+/**
+ * A recorded health state as one short row fragment, or `undefined` when there is nothing to say.
+ *
+ * THREE STATES, THREE DIFFERENT ANSWERS, and the distinction is the whole point:
+ *
+ *  - `undefined`/`unknown` -> `undefined`. No call to this target has been observed in this process, so
+ *    there is no fact. Rendering "unknown" on 113 of 114 rows would be noise that trains an operator to
+ *    ignore the column that matters, and it would also read as a verdict when it is an absence.
+ *  - `ok` -> `"last call ok"`. Short, and worth saying: it is the one row an operator can trust from
+ *    evidence rather than from the id looking plausible.
+ *  - `error` -> `"LAST CALL FAILED (<failure>)"`, upper-cased because it is the one fragment here that
+ *    should stop a hand mid-keystroke. The `HealthFailure` class is named rather than the raw provider
+ *    message: `call-failed` and `unauthenticated` are different problems with different remedies, and
+ *    the full message is 1 KB-capped prose that would not fit a select row. `/compaction-router status`
+ *    is where the message itself is read.
+ */
+export function describeHealth(health: PickableHealth | undefined): string | undefined {
+  if (!health || health.status === "unknown") return undefined;
+  if (health.status === "ok") return "last call ok";
+  const repeats = health.consecutiveFailures > 1 ? ` x${health.consecutiveFailures}` : "";
+  return `LAST CALL FAILED (${health.lastFailure ?? "unknown"}${repeats})`;
 }
 
 /**
@@ -194,6 +241,20 @@ export interface ValidationResult {
  * `src/index.ts` can find later. It deliberately does not check credentials or context fit:
  * `getApiKeyAndHeaders` is async and per-model, and the fit check needs a live preparation -- both
  * belong to the compaction path, which already performs them and already reports what it skipped.
+ *
+ * AND IT DOES NOT CHECK INVOCABILITY, which was the sentence missing from the surface rather than from
+ * this function. `find()` is a catalogue read; the catalogue LISTS models an endpoint then refuses.
+ * Reproduced live 2026-08-04 against real Bedrock: `amazon-bedrock/anthropic.claude-sonnet-5` resolves
+ * here, so the dialog wrote it and reported "New compactions use it immediately", and the first real
+ * `/compact` threw "Invocation of model ID anthropic.claude-sonnet-5 with on-demand throughput isn't
+ * supported. Retry your request with the ID or ARN of an inference profile" -- the router then fell
+ * open to pi's active model exactly as designed, and the `us.`-prefixed form of the same model routed.
+ *
+ * The remedy is NOT a probe in this function. An invocability check is one paid call per candidate,
+ * async, and would have to run inside a dialog that must never hang the editor -- the same three
+ * reasons the credential and fit checks live on the compaction path. What was wrong was the CLAIM:
+ * `resolutionNotice` below states what this check does and does not cover, and `healthNotice` reports
+ * the one invocability fact this package already owns for free.
  */
 export function validateReference(registry: Pick<PickableRegistry, "find">, reference: string): ValidationResult {
   const slash = reference.indexOf("/");
@@ -203,4 +264,59 @@ export function validateReference(registry: Pick<PickableRegistry, "find">, refe
   return registry.find(provider, modelId)
     ? { ok: true }
     : { ok: false, error: `'${reference}' is not an available model for '${provider}'.` };
+}
+
+/**
+ * What a passing `validateReference` actually established, in one sentence, where the operator is
+ * already looking.
+ *
+ * This exists because the dialog's success notice promised a working route and could only have known
+ * that the reference RESOLVES. The three clauses are each load-bearing and none is a hedge:
+ *
+ *  1. "resolve in the catalogue" -- the scope of the check that just passed.
+ *  2. "invocability is discovered on the first real compaction" -- WHEN the operator will learn
+ *     otherwise, so a later fail-open banner is a thing they were told to expect rather than a mystery.
+ *  3. The `us.`/`global.` remedy, named. Reproduced live, and the difference between a user who fixes
+ *     this in one re-open of the dialog and one who concludes the feature is broken. Without a remedy
+ *     this sentence would be a disclaimer; with it, it is instructions.
+ *
+ * Deliberately NOT conditional on the provider. A `region.`-prefixed inference profile is Bedrock's
+ * spelling of a problem several gateways have, and a notice that appeared only for `amazon-bedrock`
+ * would be silent on the next one. It is one sentence appended to a notice an operator reads once per
+ * configuration.
+ */
+export function resolutionNotice(): string {
+  return "Checked: the target(s) resolve in the catalogue. Not checked: whether the provider will accept a call to them -- invocability is discovered on the first real compaction, which fails open to Pi's active model and says so. If that happens, prefer a region- or gateway-prefixed form of the same model (us./global./eu.), which is a distinct catalogue entry.";
+}
+
+/**
+ * The free half of an invocability check: has a call this package ALREADY made to this exact target
+ * failed?
+ *
+ * Costs nothing and no provider is asked anything -- `health` is a `Map` read of results the route loop
+ * obtained on compactions the operator already paid for. It catches the reproduced case on the SECOND
+ * configuration: after the bare `anthropic.claude-sonnet-5` failed once, its recorded state is `error /
+ * call-failed`, so re-picking it in the dialog is refused-in-words rather than confirmed.
+ *
+ * It is a WARNING, not a refusal, and that is deliberate. A recorded failure can be stale -- an expired
+ * credential since restored, a provider outage since ended -- and this package's own passivity rule says
+ * a record is a memory rather than a verdict. Refusing a write on a memory would make a transient
+ * failure permanently unpickable without a restart. So the pick is written and the operator is told.
+ *
+ * Returns `undefined` when nothing is recorded against any picked target, which is the common case and
+ * leaves the notice untouched.
+ */
+export function healthNotice(picks: readonly string[], health: HealthLookup): string | undefined {
+  const failing = picks
+    .map(target => ({ target, recorded: health(target) }))
+    .filter((entry): entry is { target: string; recorded: PickableHealth } => entry.recorded?.status === "error");
+  if (!failing.length) return undefined;
+  const detail = failing.map(({ target, recorded }) => {
+    const repeats = recorded.consecutiveFailures > 1 ? ` x${recorded.consecutiveFailures}` : "";
+    // The provider's own words, when we kept them: "on-demand throughput isn't supported" is the
+    // sentence that tells an operator this is a coordinate problem and not an outage.
+    const because = recorded.lastErrorMessage ? `: ${recorded.lastErrorMessage}` : "";
+    return `'${target}' (${recorded.lastFailure ?? "unknown"}${repeats})${because}`;
+  });
+  return `WARNING: a call this session already made to ${detail.join(" and ")} FAILED. The pick was written -- a recorded failure can be stale -- but if it was a bad model coordinate rather than a transient error, it will fail again.`;
 }

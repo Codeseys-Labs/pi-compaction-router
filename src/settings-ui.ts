@@ -44,7 +44,7 @@
 
 import { fuzzyFilter, Input, SelectList, SettingsList, type SelectItem, type SelectListTheme, type SettingItem, type SettingsListTheme } from "@earendil-works/pi-tui";
 import type { Component } from "@earendil-works/pi-tui";
-import { filterModels, modelItems, modelsForProvider, providerItems, type PickableRegistry } from "./model-picker.js";
+import { filterModels, modelItems, modelsForProvider, providerItems, type HealthLookup, type PickableRegistry } from "./model-picker.js";
 
 /** How many rows either list shows before it scrolls. Pi's own pickers sit in this range. */
 const MAX_VISIBLE = 12;
@@ -76,6 +76,13 @@ export class ProviderModelPicker implements Component {
     private readonly done: (value?: string) => void,
     /** Called after any state change, so the host can re-render. `tui.requestRender()` in practice. */
     private readonly requestRender: () => void = () => {},
+    /**
+     * Recorded health per `provider/model`, or absent. `ProviderHealth.snapshot` in practice: a
+     * synchronous Map read of calls the route loop already made, never a probe. Optional so this
+     * component stays constructible from a test with no health record at all, which is also the state a
+     * fresh session is in.
+     */
+    private readonly health?: HealthLookup,
   ) {
     this.list = this.buildProviderList();
   }
@@ -108,7 +115,7 @@ export class ProviderModelPicker implements Component {
   private buildModelList(): SelectList {
     const query = this.search.getValue().trim();
     const models = filterModels(modelsForProvider(this.registry, this.provider!), query, fuzzyFilter);
-    const items: SelectItem[] = modelItems(models);
+    const items: SelectItem[] = modelItems(models, this.health);
     const list = new SelectList(items.length ? items : [{ value: "", label: `No model matches '${query}'` }], MAX_VISIBLE, this.theme);
     list.onSelect = item => {
       if (!item.value) return;
